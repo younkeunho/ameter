@@ -72,7 +72,7 @@ cargo build --release
 cargo test
 ```
 
-MSVC와 GNU 툴체인 모두 됩니다. 아이콘과 버전 정보는 `build.rs`가 직접 실행 파일에 넣으므로 리소스 컴파일러는 필요 없습니다. 아이콘은 `python assets/icon.py`(Pillow)로 다시 그립니다.
+`x86_64-pc-windows-gnu` 툴체인에서 빌드하고 테스트했습니다. 아이콘과 버전 정보는 `build.rs`가 직접 실행 파일에 넣으므로 rc.exe나 windres 같은 리소스 컴파일러는 필요 없습니다. 아이콘은 `python assets/icon.py`(Pillow)로 다시 그립니다.
 
 ## 라이선스
 
