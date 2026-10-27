@@ -2,7 +2,6 @@
 
 use crate::util::wide;
 use windows_sys::Win32::Graphics::GdiPlus::*;
-use windows_sys::Win32::UI::WindowsAndMessaging::HICON;
 
 /// 32 bpp premultiplied ARGB, the layout UpdateLayeredWindow expects.
 const PIXEL_FORMAT_32BPP_PARGB: i32 = 0x000E_200B;
@@ -69,7 +68,7 @@ impl Canvas {
         Self::create(width, height, width * 4, PIXEL_FORMAT_32BPP_PARGB, pixels)
     }
 
-    /// Owns its pixels (straight alpha); used for measuring and for the tray icon.
+    /// Owns its pixels (straight alpha); used for measuring text.
     pub fn owned(width: i32, height: i32) -> Option<Canvas> {
         Self::create(width, height, 0, PIXEL_FORMAT_32BPP_ARGB, std::ptr::null_mut())
     }
@@ -140,7 +139,7 @@ impl Canvas {
         }
     }
 
-    /// A filled, outlined rectangle with rounded corners; `border` 0 draws no outline.
+    /// A filled, outlined rectangle with rounded corners.
     pub fn rounded_rect(&self, rect: RectF, radius: f32, fill: u32, border: u32) {
         let RectF { X: x, Y: y, Width: width, Height: height } = rect;
         let d = radius * 2.0;
@@ -156,35 +155,17 @@ impl Canvas {
             GdipClosePathFigure(path);
             GdipCreateSolidFill(fill, &mut brush);
             GdipFillPath(self.graphics, brush as *mut GpBrush, path);
-            if border != 0 {
-                GdipCreatePen1(border, 1.0, UnitPixel, &mut pen);
-                GdipDrawPath(self.graphics, pen, path);
-                GdipDeletePen(pen);
-            }
+            GdipCreatePen1(border, 1.0, UnitPixel, &mut pen);
+            GdipDrawPath(self.graphics, pen, path);
+            GdipDeletePen(pen);
             GdipDeleteBrush(brush as *mut GpBrush);
             GdipDeletePath(path);
-        }
-    }
-
-    pub fn fill_rect(&self, x: f32, y: f32, width: f32, height: f32, argb: u32) {
-        let mut brush: *mut GpSolidFill = std::ptr::null_mut();
-        unsafe {
-            GdipCreateSolidFill(argb, &mut brush);
-            GdipFillRectangle(self.graphics, brush as *mut GpBrush, x, y, width, height);
-            GdipDeleteBrush(brush as *mut GpBrush);
         }
     }
 
     /// Finishes pending drawing so the pixels can be handed to Windows.
     pub fn flush(&self) {
         unsafe { GdipFlush(self.graphics, FlushIntentionSync) };
-    }
-
-    pub fn to_icon(&self) -> HICON {
-        self.flush();
-        let mut icon: HICON = std::ptr::null_mut();
-        unsafe { GdipCreateHICONFromBitmap(self.bitmap, &mut icon) };
-        icon
     }
 }
 

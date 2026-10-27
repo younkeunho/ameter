@@ -224,7 +224,7 @@ pub fn run() {
         drawn_at: None,
         hidden: true,
         menu_open: false,
-        tray_icon: make_icon(),
+        tray_icon: tray_icon(),
         tray_tip: String::new(),
         taskbar_created: unsafe { RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()) },
         hook,
@@ -389,13 +389,14 @@ fn show_menu(hwnd: HWND) {
     });
 }
 
-fn make_icon() -> HICON {
-    let Some(canvas) = Canvas::owned(32, 32) else { return std::ptr::null_mut() };
-    let tile = windows_sys::Win32::Graphics::GdiPlus::RectF { X: 1.0, Y: 1.0, Width: 30.0, Height: 30.0 };
-    canvas.rounded_rect(tile, 7.0, 0xFF_26_26_26, 0);
-    canvas.fill_rect(6.0, 8.0, 20.0, 6.0, color::CODEX);
-    canvas.fill_rect(6.0, 18.0, 13.0, 6.0, color::CLAUDE);
-    canvas.to_icon()
+/// The application icon embedded by build.rs, at the notification area's size.
+fn tray_icon() -> HICON {
+    use windows_sys::Win32::UI::HiDpi::{GetDpiForSystem, GetSystemMetricsForDpi};
+    let dpi = unsafe { GetDpiForSystem() };
+    let size = unsafe { GetSystemMetricsForDpi(SM_CXSMICON, dpi) };
+    let instance = unsafe { GetModuleHandleW(std::ptr::null()) };
+    // Resource id 1 (MAKEINTRESOURCE).
+    unsafe { LoadImageW(instance, 1 as windows_sys::core::PCWSTR, IMAGE_ICON, size, size, LR_DEFAULTCOLOR) as HICON }
 }
 
 impl App {
