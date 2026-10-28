@@ -56,7 +56,7 @@ struct Display {
     claude_weekly: bool,
     claude_five_hour: bool,
     higgsfield: bool,
-    /// Mini style: colored dots instead of names, no countdowns.
+    /// Mini style: colored dots instead of names, values only (no window labels, no countdowns).
     mini: bool,
 }
 
@@ -528,8 +528,13 @@ impl App {
             rows.push(bottom);
         }
         if d.mini {
-            // Values only: no countdowns.
-            rows.iter_mut().flat_map(|r| r.cells.iter_mut()).for_each(|c| c.reset.clear());
+            // Dots and values only: no window labels, no countdowns.
+            for cell in rows.iter_mut().flat_map(|r| r.cells.iter_mut()) {
+                cell.reset.clear();
+                if matches!(cell.label, Label::Plain(_)) {
+                    cell.label = Label::None;
+                }
+            }
         }
 
         let tip = [

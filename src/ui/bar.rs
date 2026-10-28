@@ -41,10 +41,11 @@ pub mod color {
     }
 }
 
-/// What stands before a value: a window label ("W", "5h"), a provider name ("CO", "HF"), or,
-/// in the mini style, a dot in the provider's color.
+/// What stands before a value: nothing, a window label ("W", "5h"), a provider name ("CO", "HF"),
+/// or, in the mini style, a dot in the provider's color.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Label {
+    None,
     Plain(String),
     Name(&'static str),
     Dot,
@@ -53,6 +54,7 @@ pub enum Label {
 impl Label {
     fn width(&self, canvas: &Canvas, fonts: &Fonts) -> f32 {
         match self {
+            Label::None => 0.0,
             Label::Plain(text) => canvas.text_width(text, &fonts.regular),
             Label::Name(text) => canvas.text_width(text, &fonts.name),
             Label::Dot => DOT * fonts.scale,
@@ -62,6 +64,7 @@ impl Label {
     /// `y` is the top of the text line.
     fn draw(&self, canvas: &Canvas, fonts: &Fonts, argb: u32, x: f32, y: f32) {
         match self {
+            Label::None => {}
             Label::Plain(text) => canvas.draw_text(text, &fonts.regular, argb, x, y),
             Label::Name(text) => canvas.draw_text(text, &fonts.name, argb, x, y),
             Label::Dot => {
@@ -88,7 +91,7 @@ pub struct Cell {
 impl Default for Cell {
     fn default() -> Self {
         Cell {
-            label: Label::Plain(String::new()),
+            label: Label::None,
             label_color: color::LABEL,
             value: String::new(),
             value_color: color::VALUE,
