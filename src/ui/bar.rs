@@ -41,12 +41,44 @@ pub mod color {
     }
 }
 
+/// What stands before a value: a window label ("W", "5h"), a provider name ("CO", "HF"), or,
+/// in the mini style, a dot in the provider's color.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Label {
+    Plain(String),
+    Name(&'static str),
+    Dot,
+}
+
+impl Label {
+    fn width(&self, canvas: &Canvas, fonts: &Fonts) -> f32 {
+        match self {
+            Label::Plain(text) => canvas.text_width(text, &fonts.regular),
+            Label::Name(text) => canvas.text_width(text, &fonts.name),
+            Label::Dot => DOT * fonts.scale,
+        }
+    }
+
+    /// `y` is the top of the text line.
+    fn draw(&self, canvas: &Canvas, fonts: &Fonts, argb: u32, x: f32, y: f32) {
+        match self {
+            Label::Plain(text) => canvas.draw_text(text, &fonts.regular, argb, x, y),
+            Label::Name(text) => canvas.draw_text(text, &fonts.name, argb, x, y),
+            Label::Dot => {
+                let d = DOT * fonts.scale;
+                // Centred on the capital letters and digits of the line, not on its box.
+                let cy = y + CAP_CENTER * FONT_PX * fonts.scale;
+                canvas.fill_ellipse(x, cy - d / 2.0, d, d, argb);
+            }
+        }
+    }
+}
+
 /// A slot: label, bold value, countdown ("W 94% 6d0h", "HF 7,747 11d22h"), or a muted status.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Cell {
-    pub label: String,
+    pub label: Label,
     pub label_color: u32,
-    pub label_bold: bool,
     pub value: String,
     pub value_color: u32,
     pub reset: String,
@@ -56,9 +88,8 @@ pub struct Cell {
 impl Default for Cell {
     fn default() -> Self {
         Cell {
-            label: String::new(),
+            label: Label::Plain(String::new()),
             label_color: color::LABEL,
-            label_bold: false,
             value: String::new(),
             value_color: color::VALUE,
             reset: String::new(),
@@ -76,7 +107,7 @@ impl Cell {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Row {
     /// None: the line has no name (Codex hidden but Higgsfield shown).
-    pub name: Option<String>,
+    pub name: Option<Label>,
     pub name_color: u32,
     pub cells: Vec<Cell>,
 }
@@ -111,6 +142,10 @@ const LABEL_GAP: f32 = 4.0;
 const RESET_GAP: f32 = 4.0;
 const COLUMN_GAP: f32 = 11.0;
 const RADIUS: f32 = 5.0;
+/// Diameter of a mini-style dot.
+const DOT: f32 = 7.0;
+/// Segoe UI: (ascent - cap height / 2) / em, the cap-height centre below the top of a line.
+const CAP_CENTER: f32 = (2210.0 - 1434.0 / 2.0) / 2048.0;
 
 #[derive(Clone, Debug, Default)]
 pub struct Layout {
@@ -133,7 +168,7 @@ pub fn measure(rows: &[Row], canvas: &Canvas, fonts: &Fonts) -> Layout {
         ..Default::default()
     };
     let mut status_w = vec![0.0f32; slots];
-    let name_w = rows.iter().filter_map(|r| r.name.as_deref()).map(|n| canvas.text_width(n, &fonts.name)).fold(0.0, f32::max);
+    let name_w = rows.iter().filter_map(|r| r.name.as_ref()).map(|n| n.width(canvas, fonts)).fold(0.0, f32::max);
 
     for row in rows {
         for (k, cell) in row.cells.iter().enumerate() {
@@ -141,8 +176,7 @@ pub fn measure(rows: &[Row], canvas: &Canvas, fonts: &Fonts) -> Layout {
                 status_w[k] = status_w[k].max(canvas.text_width(status, &fonts.regular));
                 continue;
             }
-            let label_font = if cell.label_bold { &fonts.name } else { &fonts.regular };
-            layout.label_w[k] = layout.label_w[k].max(canvas.text_width(&cell.label, label_font));
+            layout.label_w[k] = layout.label_w[k].max(cell.label.width(canvas, fonts));
             layout.value_w[k] = layout.value_w[k].max(canvas.text_width(&cell.value, &fonts.value));
             layout.reset_w[k] = layout.reset_w[k].max(canvas.text_width(&cell.reset, &fonts.regular));
         }
@@ -175,7 +209,7 @@ pub fn paint(rows: &[Row], layout: &Layout, canvas: &Canvas, fonts: &Fonts) {
     for (i, row) in rows.iter().enumerate() {
         let y = (PAD_Y * s + i as f32 * line_height + (line_height - text_height) / 2.0).round();
         if let Some(name) = &row.name {
-            canvas.draw_text(name, &fonts.name, row.name_color, PAD_X * s, y);
+            name.draw(canvas, fonts, row.name_color, PAD_X * s, y);
         }
         for (k, cell) in row.cells.iter().enumerate() {
             let x = layout.slot_x[k];
@@ -184,8 +218,7 @@ pub fn paint(rows: &[Row], layout: &Layout, canvas: &Canvas, fonts: &Fonts) {
                 continue;
             }
             // Label, value and countdown each start at the same x on every line.
-            let label_font = if cell.label_bold { &fonts.name } else { &fonts.regular };
-            canvas.draw_text(&cell.label, label_font, cell.label_color, x, y);
+            cell.label.draw(canvas, fonts, cell.label_color, x, y);
             let value_x = x + layout.label_w[k] + if layout.label_w[k] > 0.0 { LABEL_GAP * s } else { 0.0 };
             canvas.draw_text(&cell.value, &fonts.value, cell.value_color, value_x, y);
             if !cell.reset.is_empty() {

@@ -163,6 +163,15 @@ impl Canvas {
         }
     }
 
+    pub fn fill_ellipse(&self, x: f32, y: f32, width: f32, height: f32, argb: u32) {
+        let mut brush: *mut GpSolidFill = std::ptr::null_mut();
+        unsafe {
+            GdipCreateSolidFill(argb, &mut brush);
+            GdipFillEllipse(self.graphics, brush as *mut GpBrush, x, y, width, height);
+            GdipDeleteBrush(brush as *mut GpBrush);
+        }
+    }
+
     /// Finishes pending drawing so the pixels can be handed to Windows.
     pub fn flush(&self) {
         unsafe { GdipFlush(self.graphics, FlushIntentionSync) };

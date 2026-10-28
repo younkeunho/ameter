@@ -14,7 +14,7 @@ use crate::model::{self, FIVE_HOUR_MINS, ProviderState, WEEK_MINS};
 use crate::paths;
 use crate::poller::Poller;
 use crate::util::{self, JsonExt, wide};
-use bar::{Cell, Fonts, Layout, Row, color};
+use bar::{Cell, Fonts, Label, Layout, Row, color};
 use gdip::{Canvas, Gdiplus};
 use serde_json::json;
 use std::cell::RefCell;
@@ -46,6 +46,7 @@ const MENU_CODEX: usize = 2;
 const MENU_CLAUDE_WEEKLY: usize = 3;
 const MENU_CLAUDE_FIVE_HOUR: usize = 4;
 const MENU_HIGGSFIELD: usize = 5;
+const MENU_MINI: usize = 6;
 const MENU_EXIT: usize = 9;
 
 /// What the bar shows; toggled from the menu and kept in display.json.
@@ -55,6 +56,8 @@ struct Display {
     claude_weekly: bool,
     claude_five_hour: bool,
     higgsfield: bool,
+    /// Mini style: colored dots instead of names, no countdowns.
+    mini: bool,
 }
 
 impl Display {
@@ -70,6 +73,7 @@ impl Display {
             claude_weekly: get("claudeWeekly"),
             claude_five_hour: get("claudeFiveHour"),
             higgsfield: get("higgsfield"),
+            mini: json.bool_of("mini").unwrap_or(false),
         }
     }
 
@@ -79,6 +83,7 @@ impl Display {
             "claudeWeekly": self.claude_weekly,
             "claudeFiveHour": self.claude_five_hour,
             "higgsfield": self.higgsfield,
+            "mini": self.mini,
         });
         if let Err(e) = util::write_json(&paths::display_settings(), &json) {
             util::log(&format!("display settings save failed: {e}"));
@@ -371,6 +376,8 @@ fn show_menu(hwnd: HWND) {
         AppendMenuW(menu, MF_POPUP | check(display.claude()), claude as usize, wide("클로드").as_ptr());
         AppendMenuW(menu, MF_STRING | check(display.higgsfield), MENU_HIGGSFIELD, wide("힉스필드").as_ptr());
         AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
+        AppendMenuW(menu, MF_STRING | check(display.mini), MENU_MINI, wide("미니 스타일").as_ptr());
+        AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
         AppendMenuW(menu, MF_STRING, MENU_EXIT, wide("종료").as_ptr());
 
         let mut cursor = POINT { x: 0, y: 0 };
@@ -438,6 +445,7 @@ impl App {
             MENU_CLAUDE_WEEKLY => self.display.claude_weekly = !self.display.claude_weekly,
             MENU_CLAUDE_FIVE_HOUR => self.display.claude_five_hour = !self.display.claude_five_hour,
             MENU_HIGGSFIELD => self.display.higgsfield = !self.display.higgsfield,
+            MENU_MINI => self.display.mini = !self.display.mini,
             _ => return,
         }
         self.display.save();
@@ -501,21 +509,27 @@ impl App {
         let claude_stale = if web.as_ref().is_some_and(|w| w.available) { CLAUDE_WEB_STALE_MS } else { CLAUDE_STATUSLINE_STALE_MS };
 
         let d = self.display;
+        // The mini style marks each provider with a dot in its color instead of its name.
+        let mark = |name: &'static str| if d.mini { Label::Dot } else { Label::Name(name) };
         let mut rows = Vec::new();
-        let mut top = Row { name: d.codex.then(|| "CO".into()), name_color: color::CODEX, cells: Vec::new() };
+        let mut top = Row { name: d.codex.then(|| mark("CO")), name_color: color::CODEX, cells: Vec::new() };
         if d.codex {
             add_windows(&mut top, &codex, now_sec, now_ms, CODEX_STALE_MS, true, true);
         }
         if d.higgsfield {
-            top.cells.push(credits_cell(&higgsfield, now_sec, now_ms));
+            top.cells.push(credits_cell(mark("HF"), &higgsfield, now_sec, now_ms));
         }
         if !top.cells.is_empty() {
             rows.push(top);
         }
         if d.claude() {
-            let mut bottom = Row { name: Some("CC".into()), name_color: color::CLAUDE, cells: Vec::new() };
+            let mut bottom = Row { name: Some(mark("CC")), name_color: color::CLAUDE, cells: Vec::new() };
             add_windows(&mut bottom, &claude, now_sec, now_ms, claude_stale, d.claude_five_hour, d.claude_weekly);
             rows.push(bottom);
+        }
+        if d.mini {
+            // Values only: no countdowns.
+            rows.iter_mut().flat_map(|r| r.cells.iter_mut()).for_each(|c| c.reset.clear());
         }
 
         let tip = [
@@ -617,7 +631,7 @@ fn add_windows(row: &mut Row, state: &ProviderState, now_sec: i64, now_ms: i64, 
         if (w.duration_mins == Some(FIVE_HOUR_MINS) && !five_hour) || (w.duration_mins == Some(WEEK_MINS) && !weekly) {
             continue;
         }
-        let mut cell = Cell { label: fmt::label(w.duration_mins), ..Default::default() };
+        let mut cell = Cell { label: Label::Plain(fmt::label(w.duration_mins)), ..Default::default() };
         match w.used_percent.filter(|_| !fmt::expired(w, now_sec)) {
             None => {
                 cell.value = "—".into();
@@ -637,8 +651,8 @@ fn add_windows(row: &mut Row, state: &ProviderState, now_sec: i64, now_ms: i64, 
 }
 
 /// "HF 7,747 11d22h": remaining credits and the time until the monthly refill.
-fn credits_cell(state: &ProviderState, now_sec: i64, now_ms: i64) -> Cell {
-    let mut cell = Cell { label: "HF".into(), label_color: color::HIGGSFIELD, label_bold: true, ..Default::default() };
+fn credits_cell(label: Label, state: &ProviderState, now_sec: i64, now_ms: i64) -> Cell {
+    let mut cell = Cell { label, label_color: color::HIGGSFIELD, ..Default::default() };
     match state.credits {
         None => {
             cell.value = state.status.clone().unwrap_or_else(|| "—".into());
