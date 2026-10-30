@@ -4,6 +4,7 @@
 //! * `ameter-cli.exe` is the Claude Code statusLine command and the setup tool.
 
 pub mod autostart;
+pub mod cdp;
 pub mod claude_setup;
 pub mod claude_web;
 pub mod codex;

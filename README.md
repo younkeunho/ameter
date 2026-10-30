@@ -35,9 +35,12 @@ CC  5h 96% 4h35m   W  82%   1d2h
 | 항목 | 방법 | 주기 |
 |---|---|---|
 | Codex | 공식 `codex app-server`의 `account/rateLimits/read` | 1분 |
-| Claude | claude.ai 사용량(로그인된 Aside 브라우저에서 `aside repl`로 조회), Claude Code 상태줄의 `rate_limits` | 2분, 상태줄이 갱신될 때 |
+| Claude | claude.ai 사용량(로그인된 Aside 브라우저의 원격 디버깅 포트로 조회), Claude Code 상태줄의 `rate_limits` | 2분, 상태줄이 갱신될 때 |
 | Higgsfield | `higgsfield account status` / `account transactions` | 1분 (충전일은 6시간마다) |
 
+- claude.ai 조회는 Aside 브라우저 안에서 합니다. 탭 줄에 나오지 않는 숨은 탭을 하나 열어 두고, 그 탭에서 사용량 GET 요청 두 개를 보냅니다. 방문 기록에는 남지 않습니다.
+- Aside에서 원격 디버깅을 켜 두어야 합니다(주소창에 `chrome://inspect/#remote-debugging`). ameter가 연결하면 Aside가 "원격 디버깅을 허용하시겠습니까?"라고 묻습니다. 그 창에서 **허용**을 누르면, 연결이 유지되는 동안 다시 묻지 않습니다. Aside나 ameter를 다시 켜면 한 번 더 묻습니다.
+- 그 창이 떠 있는 동안 미터는 `허용 필요`로 표시합니다. **취소**를 누르면 Aside를 다시 켤 때까지 다시 묻지 않습니다.
 - Aside 브라우저가 꺼져 있으면 claude.ai 조회를 건너뜁니다. 브라우저를 대신 띄우지 않습니다.
 - Higgsfield는 다음 충전일을 따로 알려 주지 않습니다. 그래서 가장 최근 구독 크레딧 지급일에 한 달을 더해 계산합니다.
 
@@ -69,7 +72,7 @@ CC  5h 96% 4h35m   W  82%   1d2h
 
 ## 파일
 
-`%LOCALAPPDATA%\ameter`에 값 캐시(`codex.json`, `claude.json`, `higgsfield.json`), 메뉴 설정(`display.json`), 로그, Claude 설정 백업(`backups\`)을 둡니다. 다음 환경 변수로 위치를 바꿀 수 있습니다: `AMETER_DATA_DIR`, `AMETER_CODEX_PATH`, `AMETER_HIGGSFIELD_PATH`, `AMETER_ASIDE_PATH`.
+`%LOCALAPPDATA%\ameter`에 값 캐시(`codex.json`, `claude.json`, `higgsfield.json`), 메뉴 설정(`display.json`), 로그, Claude 설정 백업(`backups\`)을 둡니다. 다음 환경 변수로 위치를 바꿀 수 있습니다: `AMETER_DATA_DIR`, `AMETER_CODEX_PATH`, `AMETER_HIGGSFIELD_PATH`, `AMETER_ASIDE_USER_DATA`(Aside의 `User Data` 폴더).
 
 ## 빌드
 

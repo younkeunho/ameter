@@ -58,6 +58,11 @@ pub fn log_file(name: &str) -> PathBuf {
     data_dir().join(format!("{name}.log"))
 }
 
+/// The Aside browser's user data directory; its `DevToolsActivePort` names the debugging port.
+pub fn aside_user_data() -> PathBuf {
+    env_dir("AMETER_ASIDE_USER_DATA").unwrap_or_else(|| local_app_data().join("Aside").join("User Data"))
+}
+
 pub fn claude_settings() -> PathBuf {
     env_dir("CLAUDE_CONFIG_DIR").unwrap_or_else(|| home().join(".claude")).join("settings.json")
 }
