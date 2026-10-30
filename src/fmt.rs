@@ -59,8 +59,18 @@ pub fn severity(used_percent: f64) -> u8 {
     }
 }
 
-pub fn expired(w: &UsageWindow, now_sec: i64) -> bool {
-    w.resets_at.is_some_and(|r| r <= now_sec)
+/// Usage in the current window. A window whose reset has passed counts as unused only when a
+/// reading taken after the reset still showed no newer window; until then it is unknown.
+pub fn current_used(state: &ProviderState, w: &UsageWindow, now_sec: i64) -> Option<f64> {
+    match w.resets_at {
+        Some(reset) if reset <= now_sec => (state.updated_at_ms / 1000 >= reset).then_some(0.0),
+        _ => w.used_percent,
+    }
+}
+
+/// Time until the reset; none for a window that has not started (no reset, or a past one).
+pub fn countdown(w: &UsageWindow, now_sec: i64) -> Option<String> {
+    w.resets_at.filter(|r| *r > now_sec).map(|r| short(r - now_sec))
 }
 
 /// Display order: 5-hour, weekly, anything else.
@@ -100,7 +110,7 @@ pub fn terminal_line(name: &str, state: &ProviderState, now_sec: i64, ansi: bool
         line.push_str(&if i == 0 { " ".to_string() } else { paint(DIM, " · ") });
         line.push_str(&paint(DIM, &label(w.duration_mins)));
         line.push(' ');
-        match w.used_percent.filter(|_| !expired(w, now_sec)) {
+        match current_used(state, w, now_sec) {
             None => line.push('—'),
             Some(used) => {
                 let code = match severity(used) {
@@ -110,8 +120,8 @@ pub fn terminal_line(name: &str, state: &ProviderState, now_sec: i64, ansi: bool
                     _ => "\x1b[1m",
                 };
                 line.push_str(&paint(code, &left(used)));
-                if let Some(reset) = w.resets_at {
-                    line.push_str(&paint(DIM, &format!(" ({})", short(reset - now_sec))));
+                if let Some(reset) = countdown(w, now_sec) {
+                    line.push_str(&paint(DIM, &format!(" ({reset})")));
                 }
             }
         }
@@ -178,11 +188,24 @@ mod tests {
         };
         assert_eq!(terminal_line("CC", &state, now, false), "CC  5h 76% (1h13m) · W 84% (1d4h)");
 
-        let expired = ProviderState {
-            windows: vec![UsageWindow { duration_mins: Some(300), used_percent: Some(50.0), resets_at: Some(now - 1) }],
+        // Reset at now - 60: read before it, unknown; read after it with no newer window, unused.
+        let past_reset = vec![UsageWindow { duration_mins: Some(300), used_percent: Some(50.0), resets_at: Some(now - 60) }];
+        let read_before = ProviderState { windows: past_reset.clone(), updated_at_ms: (now - 120) * 1000, ..Default::default() };
+        assert_eq!(terminal_line("CC", &read_before, now, false), "CC  5h —");
+        let read_after = ProviderState { windows: past_reset, updated_at_ms: (now - 30) * 1000, ..Default::default() };
+        assert_eq!(terminal_line("CC", &read_after, now, false), "CC  5h 100%");
+
+        let not_started = ProviderState {
+            windows: vec![UsageWindow { duration_mins: Some(300), used_percent: Some(0.0), resets_at: None }],
             ..Default::default()
         };
-        assert_eq!(terminal_line("CC", &expired, now, false), "CC  5h —");
+        assert_eq!(terminal_line("CC", &not_started, now, false), "CC  5h 100%");
+
+        let unknown = ProviderState {
+            windows: vec![UsageWindow { duration_mins: Some(300), used_percent: None, resets_at: Some(now + 60) }],
+            ..Default::default()
+        };
+        assert_eq!(terminal_line("CC", &unknown, now, false), "CC  5h —");
         assert_eq!(terminal_line("CO", &ProviderState::with_status("확인 중…"), now, false), "CO  확인 중…");
     }
 }

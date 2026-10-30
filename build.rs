@@ -1,4 +1,5 @@
-//! Embeds the icon (assets/ameter.ico) and the version information into both executables.
+//! Embeds the icon (assets/ameter.ico), the version information and the application manifest
+//! into both executables.
 //!
 //! The resources are written straight into a COFF object with a `.rsrc` section (what a
 //! resource compiler produces), so building needs no rc.exe or windres on either toolchain.
@@ -10,6 +11,9 @@ use std::path::PathBuf;
 const RT_ICON: u32 = 3;
 const RT_GROUP_ICON: u32 = 14;
 const RT_VERSION: u32 = 16;
+const RT_MANIFEST: u32 = 24;
+/// CREATEPROCESS_MANIFEST_RESOURCE_ID: the manifest the loader reads for an .exe.
+const MANIFEST_ID: u32 = 1;
 const LANG_NEUTRAL: u32 = 0;
 const LANG_EN_US: u32 = 0x0409;
 
@@ -35,6 +39,7 @@ fn main() {
 
     let mut resources = icons(&fs::read("assets/ameter.ico").expect("assets/ameter.ico"));
     resources.push(Resource { kind: RT_VERSION, name: 1, lang: LANG_EN_US, data: version_info() });
+    resources.push(Resource { kind: RT_MANIFEST, name: MANIFEST_ID, lang: LANG_EN_US, data: MANIFEST.as_bytes().to_vec() });
 
     let extension = if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") { "obj" } else { "o" };
     let out = PathBuf::from(env::var("OUT_DIR").unwrap()).join(format!("ameter-resources.{extension}"));
@@ -55,6 +60,24 @@ fn u16s(buf: &mut Vec<u8>, values: &[u16]) {
 fn u32s(buf: &mut Vec<u8>, values: &[u32]) {
     buf.extend(values.iter().flat_map(|v| v.to_le_bytes()));
 }
+
+/// Windows 10/11 compatibility (layered child windows, which the meter is, need Windows 8 or
+/// later declared here) and per-monitor v2 DPI awareness.
+const MANIFEST: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+    </application>
+  </compatibility>
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2</dpiAwareness>
+    </windowsSettings>
+  </application>
+</assembly>
+"#;
 
 // ---------------------------------------------------------------- icon
 

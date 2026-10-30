@@ -1,5 +1,10 @@
 //! ameter.exe: the taskbar meter. Top line Codex (CO) and Higgsfield credits (HF), bottom line
 //! Claude (CC). Right-click switches items on and off; double-click refreshes.
+//!
+//! Two windows: a hidden top-level host (timer, notification icon, menu, Explorer restarts) and
+//! the meter itself, a layered child of the taskbar. As part of the taskbar the meter moves,
+//! hides and rises with it: opening Start lifts the taskbar above every topmost window, which a
+//! separate topmost window could only chase a frame late.
 
 mod bar;
 mod gdip;
@@ -25,8 +30,6 @@ use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HWND, L
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::CreateMutexW;
-use windows_sys::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
-use windows_sys::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
 use windows_sys::Win32::UI::Shell::{NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW, Shell_NotifyIconW};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
@@ -56,7 +59,7 @@ struct Display {
     claude_weekly: bool,
     claude_five_hour: bool,
     higgsfield: bool,
-    /// Mini style: colored dots instead of names, values only (no window labels, no countdowns).
+    /// Mini style: colored dots instead of names, no countdowns, no window labels but Claude's "W".
     mini: bool,
 }
 
@@ -119,20 +122,26 @@ struct App {
     fonts: Fonts,
     rows: Vec<Row>,
     layout: Layout,
+    /// Where the meter was last drawn, in taskbar coordinates; None until drawn.
     drawn_at: Option<(i32, i32)>,
     hidden: bool,
-    menu_open: bool,
     tray_icon: HICON,
     tray_tip: String,
     taskbar_created: u32,
-    hook: HWINEVENTHOOK,
 }
 
 thread_local! {
     static APP: RefCell<Option<App>> = const { RefCell::new(None) };
 }
 
+/// The host window.
 static HWND_VALUE: AtomicIsize = AtomicIsize::new(0);
+/// The meter window, 0 while there is none. Cleared when it is destroyed, by ameter or because
+/// Explorer (its parent) went away.
+static METER: AtomicIsize = AtomicIsize::new(0);
+
+const HOST_CLASS: &str = "ameter.host";
+const METER_CLASS: &str = "ameter.meter";
 
 /// Runs `f` on the app unless it is already borrowed (a nested message during a call).
 fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
@@ -146,8 +155,9 @@ fn post(message: u32) {
     }
 }
 
+/// DPI awareness (per-monitor v2) and the Windows 10 compatibility that layered child windows
+/// need come from the manifest build.rs embeds.
 pub fn run() {
-    unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
     let _instance = match single_instance() {
         Some(handle) => handle,
         None => return,
@@ -160,7 +170,7 @@ pub fn run() {
         util::log("GDI+ failed to start");
         return;
     };
-    let Some(hwnd) = create_window() else {
+    let Some(hwnd) = create_host() else {
         util::log("window creation failed");
         return;
     };
@@ -202,17 +212,6 @@ pub fn run() {
     };
 
     let scale = taskbar::locate().map(|t| t.scale).unwrap_or(1.0);
-    let hook = unsafe {
-        SetWinEventHook(
-            EVENT_SYSTEM_FOREGROUND,
-            EVENT_SYSTEM_FOREGROUND,
-            std::ptr::null_mut(),
-            Some(on_foreground),
-            0,
-            0,
-            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
-        )
-    };
     let mut app = App {
         hwnd,
         shared,
@@ -228,11 +227,9 @@ pub fn run() {
         layout: Layout::default(),
         drawn_at: None,
         hidden: true,
-        menu_open: false,
         tray_icon: tray_icon(),
         tray_tip: String::new(),
         taskbar_created: unsafe { RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()) },
-        hook,
     };
     app.apply_display();
     app.tray(NIM_ADD);
@@ -259,16 +256,15 @@ fn single_instance() -> Option<windows_sys::Win32::Foundation::HANDLE> {
     (!handle.is_null() && unsafe { GetLastError() } != ERROR_ALREADY_EXISTS).then_some(handle)
 }
 
-fn create_window() -> Option<HWND> {
-    let instance = unsafe { GetModuleHandleW(std::ptr::null()) };
-    let class = wide("ameter.meter");
+fn register_class(name: &str, proc: WNDPROC, style: WNDCLASS_STYLES) -> bool {
+    let class = wide(name);
     let wc = WNDCLASSEXW {
         cbSize: size_of::<WNDCLASSEXW>() as u32,
-        style: CS_DBLCLKS,
-        lpfnWndProc: Some(window_proc),
+        style,
+        lpfnWndProc: proc,
         cbClsExtra: 0,
         cbWndExtra: 0,
-        hInstance: instance,
+        hInstance: unsafe { GetModuleHandleW(std::ptr::null()) },
         hIcon: std::ptr::null_mut(),
         hCursor: unsafe { LoadCursorW(std::ptr::null_mut(), IDC_ARROW) },
         hbrBackground: std::ptr::null_mut(),
@@ -276,13 +272,18 @@ fn create_window() -> Option<HWND> {
         lpszClassName: class.as_ptr(),
         hIconSm: std::ptr::null_mut(),
     };
-    if unsafe { RegisterClassExW(&wc) } == 0 {
+    unsafe { RegisterClassExW(&wc) != 0 }
+}
+
+/// The never-shown top-level window that owns the timer, the notification icon and the menu.
+fn create_host() -> Option<HWND> {
+    if !register_class(HOST_CLASS, Some(window_proc), 0) || !register_class(METER_CLASS, Some(meter_proc), CS_DBLCLKS) {
         return None;
     }
     let hwnd = unsafe {
         CreateWindowExW(
-            WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
-            class.as_ptr(),
+            WS_EX_TOOLWINDOW,
+            wide(HOST_CLASS).as_ptr(),
             wide("ameter").as_ptr(),
             WS_POPUP,
             0,
@@ -291,38 +292,67 @@ fn create_window() -> Option<HWND> {
             0,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            instance,
+            GetModuleHandleW(std::ptr::null()),
             std::ptr::null(),
         )
     };
     (!hwnd.is_null()).then_some(hwnd)
 }
 
+/// The meter: a hidden layered child of `taskbar`, drawn with UpdateLayeredWindow.
+fn create_meter(taskbar: HWND) -> HWND {
+    unsafe {
+        CreateWindowExW(
+            // No WM_PARENTNOTIFY: Explorer never waits on ameter.
+            WS_EX_LAYERED | WS_EX_NOPARENTNOTIFY,
+            wide(METER_CLASS).as_ptr(),
+            wide("ameter").as_ptr(),
+            WS_CHILD | WS_CLIPSIBLINGS,
+            0,
+            0,
+            0,
+            0,
+            taskbar,
+            std::ptr::null_mut(),
+            GetModuleHandleW(std::ptr::null()),
+            std::ptr::null(),
+        )
+    }
+}
+
 fn modified(path: &std::path::Path) -> Option<SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
-unsafe extern "system" fn on_foreground(_: HWINEVENTHOOK, _: u32, _: HWND, _: i32, _: i32, _: u32, _: u32) {
-    with_app(|app| app.sync(false));
+unsafe extern "system" fn meter_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    match msg {
+        WM_MOUSEACTIVATE => return MA_NOACTIVATE as LRESULT,
+        WM_RBUTTONUP => {
+            show_menu(HWND_VALUE.load(Ordering::SeqCst) as HWND);
+            return 0;
+        }
+        WM_LBUTTONDBLCLK => {
+            with_app(App::refresh_all);
+            return 0;
+        }
+        WM_NCDESTROY => {
+            let _ = METER.compare_exchange(hwnd as isize, 0, Ordering::SeqCst, Ordering::SeqCst);
+            // Explorer took the meter down with the taskbar: build a new one once it is back.
+            post(WM_APP_UPDATE);
+        }
+        _ => {}
+    }
+    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
 
 unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
-        WM_MOUSEACTIVATE => return MA_NOACTIVATE as LRESULT,
         WM_TIMER if wparam == TIMER_TICK => {
             with_app(App::tick);
             return 0;
         }
         WM_APP_UPDATE => {
             with_app(App::on_update);
-            return 0;
-        }
-        WM_RBUTTONUP => {
-            show_menu(hwnd);
-            return 0;
-        }
-        WM_LBUTTONDBLCLK => {
-            with_app(App::refresh_all);
             return 0;
         }
         WM_APP_TRAY => {
@@ -357,11 +387,9 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
 
+/// The context menu, owned by the host window.
 fn show_menu(hwnd: HWND) {
-    let Some(display) = with_app(|app| {
-        app.menu_open = true;
-        app.display
-    }) else {
+    let Some(display) = with_app(|app| app.display) else {
         return;
     };
     let check = |on: bool| if on { MF_CHECKED } else { MF_UNCHECKED };
@@ -382,7 +410,7 @@ fn show_menu(hwnd: HWND) {
 
         let mut cursor = POINT { x: 0, y: 0 };
         GetCursorPos(&mut cursor);
-        // The meter never activates; take the foreground so the menu closes on an outside click.
+        // Take the foreground so the menu closes on an outside click.
         SetForegroundWindow(hwnd);
         let flags = TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY | TPM_RIGHTALIGN | TPM_BOTTOMALIGN;
         let command = TrackPopupMenu(menu, flags, cursor.x, cursor.y, 0, hwnd, std::ptr::null()) as usize;
@@ -390,10 +418,7 @@ fn show_menu(hwnd: HWND) {
         DestroyMenu(menu); // destroys the submenu too
         command
     };
-    with_app(|app| {
-        app.menu_open = false;
-        app.on_command(command);
-    });
+    with_app(|app| app.on_command(command));
 }
 
 /// The application icon embedded by build.rs, at the notification area's size.
@@ -438,7 +463,8 @@ impl App {
         match command {
             MENU_REFRESH => return self.refresh_all(),
             MENU_EXIT => {
-                unsafe { DestroyWindow(self.hwnd) };
+                // Closed from the message loop, outside this borrow, so WM_DESTROY can shut down.
+                unsafe { PostMessageW(self.hwnd, WM_CLOSE, 0, 0) };
                 return;
             }
             MENU_CODEX => self.display.codex = !self.display.codex,
@@ -462,8 +488,9 @@ impl App {
 
     fn shutdown(&mut self) {
         unsafe { KillTimer(self.hwnd, TIMER_TICK) };
-        if !self.hook.is_null() {
-            unsafe { UnhookWinEvent(self.hook) };
+        let meter = METER.load(Ordering::SeqCst) as HWND;
+        if !meter.is_null() {
+            unsafe { DestroyWindow(meter) };
         }
         self.tray(NIM_DELETE);
         if !self.tray_icon.is_null() {
@@ -519,22 +546,21 @@ impl App {
         if d.higgsfield {
             top.cells.push(credits_cell(mark("HF"), &higgsfield, now_sec, now_ms));
         }
+        if d.mini {
+            minify(&mut top, None);
+        }
         if !top.cells.is_empty() {
             rows.push(top);
         }
         if d.claude() {
             let mut bottom = Row { name: Some(mark("CC")), name_color: color::CLAUDE, cells: Vec::new() };
             add_windows(&mut bottom, &claude, now_sec, now_ms, claude_stale, d.claude_five_hour, d.claude_weekly);
-            rows.push(bottom);
-        }
-        if d.mini {
-            // Dots and values only: no window labels, no countdowns.
-            for cell in rows.iter_mut().flat_map(|r| r.cells.iter_mut()) {
-                cell.reset.clear();
-                if matches!(cell.label, Label::Plain(_)) {
-                    cell.label = Label::None;
-                }
+            if d.mini {
+                // Claude's weekly keeps its "W": it tells the two Claude numbers apart and fills the
+                // label column under Higgsfield's dot.
+                minify(&mut bottom, Some(&Label::Plain(fmt::label(Some(WEEK_MINS)))));
             }
+            rows.push(bottom);
         }
 
         let tip = [
@@ -546,7 +572,26 @@ impl App {
         (rows, tip)
     }
 
-    /// Placement, fullscreen hiding, redraw on change, and the topmost z-order.
+    /// The meter inside the current taskbar, created on first use and again after Explorer restarts.
+    fn meter(&mut self, taskbar: HWND) -> Option<HWND> {
+        let mut meter = METER.load(Ordering::SeqCst) as HWND;
+        if !meter.is_null() && unsafe { GetParent(meter) } != taskbar {
+            unsafe { DestroyWindow(meter) };
+            meter = std::ptr::null_mut();
+        }
+        if meter.is_null() {
+            meter = create_meter(taskbar);
+            if meter.is_null() {
+                return None;
+            }
+            METER.store(meter as isize, Ordering::SeqCst);
+            self.hidden = true;
+            self.drawn_at = None;
+        }
+        Some(meter)
+    }
+
+    /// Placement, redraw on change, and the meter's place above the taskbar's own content.
     fn sync(&mut self, force: bool) {
         let (rows, tip) = self.build_rows();
         if tip != self.tray_tip {
@@ -554,22 +599,28 @@ impl App {
             self.tray(NIM_MODIFY);
         }
 
-        let taskbar = taskbar::locate();
-        // Hidden while everything is switched off, or under a fullscreen app.
-        let hidden = rows.is_empty() || taskbar::fullscreen_app_active(taskbar.as_ref());
-        if hidden != self.hidden {
-            self.hidden = hidden;
-            unsafe { ShowWindow(self.hwnd, if hidden { SW_HIDE } else { SW_SHOWNOACTIVATE }) };
-        }
+        let Some(taskbar) = taskbar::locate() else {
+            self.rows = rows;
+            return;
+        };
+        let Some(meter) = self.meter(taskbar.hwnd) else {
+            self.rows = rows;
+            return;
+        };
+        // Hidden while everything is switched off.
+        let hidden = rows.is_empty();
         if hidden {
+            if !self.hidden {
+                self.hidden = true;
+                unsafe { ShowWindow(meter, SW_HIDE) };
+            }
             self.rows = rows;
             return;
         }
 
-        let scale = taskbar.as_ref().map(|t| t.scale).unwrap_or(1.0);
         let mut redraw = force;
-        if (scale - self.fonts.scale).abs() > f32::EPSILON {
-            self.fonts = Fonts::new(scale);
+        if (taskbar.scale - self.fonts.scale).abs() > f32::EPSILON {
+            self.fonts = Fonts::new(taskbar.scale);
             redraw = true;
         }
         if redraw || rows != self.rows || self.drawn_at.is_none() {
@@ -577,20 +628,24 @@ impl App {
             self.rows = rows;
             redraw = true;
         }
-        let at = taskbar::place(taskbar.as_ref(), self.layout.width, self.layout.height, scale);
+        let at = taskbar::place(&taskbar, self.layout.width, self.layout.height);
         if redraw || self.drawn_at != Some(at) {
-            self.present(at);
+            self.present(meter, at);
             self.drawn_at = Some(at);
         }
-        if !self.menu_open {
-            unsafe {
-                SetWindowPos(self.hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
-            }
+        if self.hidden {
+            self.hidden = false;
+            unsafe { ShowWindow(meter, SW_SHOWNA) };
+        }
+        // The taskbar's XAML content is a sibling window covering the whole bar: stay above it.
+        if unsafe { GetWindow(taskbar.hwnd, GW_CHILD) } != meter {
+            unsafe { SetWindowPos(meter, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE) };
         }
     }
 
-    /// Paints premultiplied ARGB straight into a DIB section and hands it to UpdateLayeredWindow.
-    fn present(&self, (x, y): (i32, i32)) {
+    /// Moves the meter to `(x, y)` in taskbar coordinates and paints premultiplied ARGB straight
+    /// into a DIB section for UpdateLayeredWindow.
+    fn present(&self, meter: HWND, (x, y): (i32, i32)) {
         let (width, height) = (self.layout.width.max(1), self.layout.height.max(1));
         unsafe {
             let screen = GetDC(std::ptr::null_mut());
@@ -610,17 +665,29 @@ impl App {
                     bar::paint(&self.rows, &self.layout, &canvas, &self.fonts);
                     canvas.flush();
                 }
-                let destination = POINT { x, y };
+                // A child's position is in its parent's coordinates, which UpdateLayeredWindow does
+                // not take: move first, then hand over the pixels at the new size.
+                SetWindowPos(meter, std::ptr::null_mut(), x, y, width, height, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW);
                 let source = POINT { x: 0, y: 0 };
                 let size = SIZE { cx: width, cy: height };
                 let blend =
                     BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, BlendFlags: 0, SourceConstantAlpha: 255, AlphaFormat: AC_SRC_ALPHA as u8 };
-                UpdateLayeredWindow(self.hwnd, screen, &destination, &size, memory, &source, 0, &blend, ULW_ALPHA);
+                UpdateLayeredWindow(meter, screen, std::ptr::null(), &size, memory, &source, 0, &blend, ULW_ALPHA);
                 SelectObject(memory, previous);
                 DeleteObject(dib);
             }
             DeleteDC(memory);
             ReleaseDC(std::ptr::null_mut(), screen);
+        }
+    }
+}
+
+/// Mini style: values without countdowns or window labels, except the label `keep`.
+fn minify(row: &mut Row, keep: Option<&Label>) {
+    for cell in &mut row.cells {
+        cell.reset.clear();
+        if matches!(cell.label, Label::Plain(_)) && Some(&cell.label) != keep {
+            cell.label = Label::None;
         }
     }
 }
@@ -637,14 +704,14 @@ fn add_windows(row: &mut Row, state: &ProviderState, now_sec: i64, now_ms: i64, 
             continue;
         }
         let mut cell = Cell { label: Label::Plain(fmt::label(w.duration_mins)), ..Default::default() };
-        match w.used_percent.filter(|_| !fmt::expired(w, now_sec)) {
+        match fmt::current_used(state, w, now_sec) {
             None => {
                 cell.value = "—".into();
                 cell.value_color = color::MUTED;
             }
             Some(used) => {
                 cell.value = fmt::left(used);
-                cell.reset = w.resets_at.map(|r| fmt::short(r - now_sec)).unwrap_or_default();
+                cell.reset = fmt::countdown(w, now_sec).unwrap_or_default();
                 cell.value_color = color::for_severity(fmt::severity(used));
             }
         }
