@@ -69,14 +69,21 @@ pub fn parse_result(result: &Map<String, Value>) -> Result<Map<String, Value>, (
     if usage_status != 200 {
         return Err(("연결 실패", format!("claude.ai 사용량 응답 {usage_status}")));
     }
+    // A window the response does not report (null) no longer exists for this account.
     let mut observed = Map::new();
     for (key, _) in CLAUDE_WINDOWS {
-        let Some(window) = result.obj(key) else { continue };
-        if let Some(entry) = model::claude_entry(window.f64_of("utilization"), window.get("resets_at")) {
-            observed.insert(key.into(), entry);
+        match result.obj(key) {
+            Some(window) => {
+                if let Some(entry) = model::claude_entry(window.f64_of("utilization"), window.get("resets_at")) {
+                    observed.insert(key.into(), entry);
+                }
+            }
+            None => {
+                observed.insert(key.into(), Value::Null);
+            }
         }
     }
-    if observed.is_empty() {
+    if observed.values().all(Value::is_null) {
         return Err(("데이터 없음", "claude.ai 응답에 사용량이 없습니다".into()));
     }
     Ok(observed)
@@ -270,6 +277,17 @@ mod tests {
         let observed = parse_result(&result).unwrap();
         assert_eq!(observed["five_hour"]["usedPercent"].as_f64(), Some(19.0));
         assert!(observed["seven_day"]["resetsAt"].as_i64().is_some());
+    }
+
+    #[test]
+    fn a_window_reported_as_null_is_marked_gone() {
+        let result = obj(json!({
+            "orgStatus": 200, "usageStatus": 200, "five_hour": null,
+            "seven_day": { "utilization": 18.0, "resets_at": "2026-11-04T11:00:00+00:00" }
+        }));
+        let observed = parse_result(&result).unwrap();
+        assert!(observed["five_hour"].is_null());
+        assert_eq!(observed["seven_day"]["usedPercent"].as_f64(), Some(18.0));
     }
 
     #[test]

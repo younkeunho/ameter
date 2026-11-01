@@ -205,7 +205,37 @@ pub fn compare_window(existing: Option<&Map<String, Value>>, incoming: &Map<Stri
     }
 }
 
-/// Merges observed windows ({key: entry}) into the Claude cache under a cross-process mutex.
+/// Applies observed windows ({key: entry}) to the cached ones; returns (accepted, changed).
+/// An entry of `null` means the source reports no such window (Anthropic dropped the limit);
+/// claude.ai's word for that removes the window. A window that has already ended says nothing
+/// about the current one and is ignored.
+pub fn apply_windows(windows: &mut Map<String, Value>, observed: &Map<String, Value>, authoritative: bool, now_sec: i64) -> (bool, bool) {
+    let mut accepted = false;
+    let mut changed = false;
+    for (key, incoming) in observed {
+        match incoming {
+            Value::Null if authoritative => {
+                accepted = true;
+                changed |= windows.remove(key).is_some();
+            }
+            Value::Object(incoming) if !incoming.i64_of("resetsAt").is_some_and(|r| r <= now_sec) => {
+                match compare_window(windows.obj(key), incoming, authoritative) {
+                    Verdict::Keep => {}
+                    Verdict::Same => accepted = true,
+                    Verdict::Take => {
+                        accepted = true;
+                        changed = true;
+                        windows.insert(key.clone(), Value::Object(incoming.clone()));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    (accepted, changed)
+}
+
+/// Merges observed windows into the Claude cache under a cross-process mutex.
 /// Returns whether the observation was accepted.
 pub fn merge_claude(observed: &Map<String, Value>, authoritative: bool, source: &str, now_ms: i64) -> bool {
     if observed.is_empty() {
@@ -215,21 +245,7 @@ pub fn merge_claude(observed: &Map<String, Value>, authoritative: bool, source: 
     let path = paths::claude_cache();
     let mut cache = util::read_json_object(&path).unwrap_or_default();
     let mut windows = cache.obj("windows").cloned().unwrap_or_default();
-
-    let mut accepted = false;
-    let mut changed = false;
-    for (key, incoming) in observed {
-        let Some(incoming) = incoming.as_object() else { continue };
-        match compare_window(windows.obj(key), incoming, authoritative) {
-            Verdict::Keep => continue,
-            Verdict::Same => accepted = true,
-            Verdict::Take => {
-                accepted = true;
-                changed = true;
-                windows.insert(key.clone(), Value::Object(incoming.clone()));
-            }
-        }
-    }
+    let (accepted, changed) = apply_windows(&mut windows, observed, authoritative, now_ms / 1000);
     if !accepted {
         return false;
     }
@@ -309,6 +325,36 @@ mod tests {
         assert_eq!(compare_window(Some(&current), &entry(20.0, 10_000), true), Verdict::Take);
         assert_eq!(compare_window(Some(&current), &entry(30.0, 10_000), true), Verdict::Same);
         assert_eq!(compare_window(Some(&current), &entry(50.0, 10_000 - 18_000), true), Verdict::Keep);
+    }
+
+    #[test]
+    fn a_window_claude_ai_no_longer_reports_is_dropped() {
+        let now = 20_000;
+        let mut windows = Map::new();
+        windows.insert("five_hour".into(), Value::Object(entry(0.0, now - 3600)));
+        windows.insert("seven_day".into(), Value::Object(entry(18.0, now + 86_400)));
+        let observed: Map<String, Value> =
+            [("five_hour".to_string(), Value::Null), ("seven_day".to_string(), Value::Object(entry(19.0, now + 86_400)))]
+                .into_iter()
+                .collect();
+
+        // The statusline cannot tell an absent window from missing input: nothing is removed.
+        let mut from_statusline = windows.clone();
+        apply_windows(&mut from_statusline, &observed, false, now);
+        assert!(from_statusline.contains_key("five_hour"));
+
+        assert_eq!(apply_windows(&mut windows, &observed, true, now), (true, true));
+        assert!(!windows.contains_key("five_hour"));
+        assert_eq!(windows.obj("seven_day").and_then(|w| w.f64_of("usedPercent")), Some(19.0));
+    }
+
+    #[test]
+    fn an_ended_window_is_not_brought_back() {
+        let now = 20_000;
+        let mut windows = Map::new();
+        let ended: Map<String, Value> = [("five_hour".to_string(), Value::Object(entry(40.0, now - 60)))].into_iter().collect();
+        assert_eq!(apply_windows(&mut windows, &ended, false, now), (false, false));
+        assert!(windows.is_empty());
     }
 
     #[test]
