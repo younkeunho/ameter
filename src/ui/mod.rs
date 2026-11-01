@@ -547,7 +547,7 @@ impl App {
             top.cells.push(credits_cell(mark("HF"), &higgsfield, now_sec, now_ms));
         }
         if d.mini {
-            minify(&mut top, None);
+            minify(&mut top);
         }
         if !top.cells.is_empty() {
             rows.push(top);
@@ -556,9 +556,7 @@ impl App {
             let mut bottom = Row { name: Some(mark("CC")), name_color: color::CLAUDE, cells: Vec::new() };
             add_windows(&mut bottom, &claude, now_sec, now_ms, claude_stale, d.claude_five_hour, d.claude_weekly);
             if d.mini {
-                // Claude's weekly keeps its "W": it tells the two Claude numbers apart and fills the
-                // label column under Higgsfield's dot.
-                minify(&mut bottom, Some(&Label::Plain(fmt::label(Some(WEEK_MINS)))));
+                minify(&mut bottom);
             }
             rows.push(bottom);
         }
@@ -682,12 +680,17 @@ impl App {
     }
 }
 
-/// Mini style: values without countdowns or window labels, except the label `keep`.
-fn minify(row: &mut Row, keep: Option<&Label>) {
+/// Mini style: values without countdowns. A provider's first window drops its label (the dot
+/// stands for it); a second window of the same provider keeps it, so the two stay apart.
+fn minify(row: &mut Row) {
+    let mut first = true;
     for cell in &mut row.cells {
         cell.reset.clear();
-        if matches!(cell.label, Label::Plain(_)) && Some(&cell.label) != keep {
-            cell.label = Label::None;
+        if matches!(cell.label, Label::Plain(_)) {
+            if first {
+                cell.label = Label::None;
+            }
+            first = false;
         }
     }
 }
@@ -738,4 +741,32 @@ fn credits_cell(label: Label, state: &ProviderState, now_sec: i64, now_ms: i64) 
         }
     }
     cell
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn window(label: &str) -> Cell {
+        Cell { label: Label::Plain(label.into()), value: "90%".into(), reset: "3d6h".into(), ..Default::default() }
+    }
+
+    #[test]
+    fn mini_labels_only_a_second_window_of_the_same_provider() {
+        let labels = |row: &Row| row.cells.iter().map(|c| c.label.clone()).collect::<Vec<_>>();
+
+        let mut claude = Row { name: Some(Label::Dot), name_color: 0, cells: vec![window("W")] };
+        minify(&mut claude);
+        assert_eq!(labels(&claude), [Label::None]);
+        assert!(claude.cells.iter().all(|c| c.reset.is_empty()));
+
+        let mut both = Row { name: Some(Label::Dot), name_color: 0, cells: vec![window("5h"), window("W")] };
+        minify(&mut both);
+        assert_eq!(labels(&both), [Label::None, Label::Plain("W".into())]);
+
+        let credits = Cell { label: Label::Dot, value: "7,113".into(), ..Default::default() };
+        let mut codex = Row { name: Some(Label::Dot), name_color: 0, cells: vec![window("W"), credits] };
+        minify(&mut codex);
+        assert_eq!(labels(&codex), [Label::None, Label::Dot]);
+    }
 }
