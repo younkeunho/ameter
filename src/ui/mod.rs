@@ -1,5 +1,6 @@
 //! ameter.exe: the taskbar meter. Top line Codex (CO) and Higgsfield credits (HF), bottom line
-//! Claude (CC). Right-click switches items on and off; double-click refreshes.
+//! Claude (CC); the mini style puts Codex, Claude and Higgsfield on one line. Right-click switches
+//! items on and off; double-click refreshes.
 //!
 //! Two windows: a hidden top-level host (timer, notification icon, menu, Explorer restarts) and
 //! the meter itself, a layered child of the taskbar. As part of the taskbar the meter moves,
@@ -59,7 +60,8 @@ struct Display {
     claude_weekly: bool,
     claude_five_hour: bool,
     higgsfield: bool,
-    /// Mini style: colored dots instead of names, no countdowns, no window labels but Claude's "W".
+    /// Mini style: one line of Codex, Claude and Higgsfield, each led by a dot in its color, without
+    /// countdowns; only a provider's second window keeps its label.
     mini: bool,
 }
 
@@ -536,29 +538,38 @@ impl App {
         let claude_stale = if web.as_ref().is_some_and(|w| w.available) { CLAUDE_WEB_STALE_MS } else { CLAUDE_STATUSLINE_STALE_MS };
 
         let d = self.display;
-        // The mini style marks each provider with a dot in its color instead of its name.
-        let mark = |name: &'static str| if d.mini { Label::Dot } else { Label::Name(name) };
         let mut rows = Vec::new();
-        let mut top = Row { name: d.codex.then(|| mark("CO")), name_color: color::CODEX, cells: Vec::new() };
-        if d.codex {
-            add_windows(&mut top, &codex, now_sec, now_ms, CODEX_STALE_MS, true, true);
-        }
-        if d.higgsfield {
-            top.cells.push(credits_cell(mark("HF"), &higgsfield, now_sec, now_ms));
-        }
         if d.mini {
-            minify(&mut top);
-        }
-        if !top.cells.is_empty() {
-            rows.push(top);
-        }
-        if d.claude() {
-            let mut bottom = Row { name: Some(mark("CC")), name_color: color::CLAUDE, cells: Vec::new() };
-            add_windows(&mut bottom, &claude, now_sec, now_ms, claude_stale, d.claude_five_hour, d.claude_weekly);
-            if d.mini {
-                minify(&mut bottom);
+            let mut providers = Vec::new();
+            if d.codex {
+                providers.push((color::CODEX, windows(&codex, now_sec, now_ms, CODEX_STALE_MS, true, true)));
             }
-            rows.push(bottom);
+            if d.claude() {
+                providers.push((color::CLAUDE, windows(&claude, now_sec, now_ms, claude_stale, d.claude_five_hour, d.claude_weekly)));
+            }
+            if d.higgsfield {
+                providers.push((color::HIGGSFIELD, vec![credits_cell(Label::None, &higgsfield, now_sec, now_ms)]));
+            }
+            let line = mini_line(providers);
+            if !line.cells.is_empty() {
+                rows.push(line);
+            }
+        } else {
+            let mut top = Row { name: d.codex.then_some(Label::Name("CO")), name_color: color::CODEX, cells: Vec::new() };
+            if d.codex {
+                top.cells.extend(windows(&codex, now_sec, now_ms, CODEX_STALE_MS, true, true));
+            }
+            if d.higgsfield {
+                top.cells.push(credits_cell(Label::Name("HF"), &higgsfield, now_sec, now_ms));
+            }
+            if !top.cells.is_empty() {
+                rows.push(top);
+            }
+            if d.claude() {
+                let mut bottom = Row { name: Some(Label::Name("CC")), name_color: color::CLAUDE, cells: Vec::new() };
+                bottom.cells.extend(windows(&claude, now_sec, now_ms, claude_stale, d.claude_five_hour, d.claude_weekly));
+                rows.push(bottom);
+            }
         }
 
         let tip = [
@@ -680,28 +691,31 @@ impl App {
     }
 }
 
-/// Mini style: values without countdowns. A provider's first window drops its label (the dot
-/// stands for it); a second window of the same provider keeps it, so the two stay apart.
-fn minify(row: &mut Row) {
-    let mut first = true;
-    for cell in &mut row.cells {
-        cell.reset.clear();
-        if matches!(cell.label, Label::Plain(_)) {
-            if first {
-                cell.label = Label::None;
+/// Mini style: one line of providers in the given order, without countdowns. A dot in the
+/// provider's color takes the place of its first value's label; a second window of the same
+/// provider keeps its label, so the two stay apart.
+fn mini_line(providers: Vec<(u32, Vec<Cell>)>) -> Row {
+    let mut cells = Vec::new();
+    for (dot_color, group) in providers {
+        for (i, mut cell) in group.into_iter().enumerate() {
+            cell.reset.clear();
+            if i == 0 {
+                cell.label = Label::Dot;
+                cell.label_color = dot_color;
             }
-            first = false;
+            cells.push(cell);
         }
     }
+    Row { name: None, name_color: 0, cells }
 }
 
 /// "W 94% 6d0h" per window, or one status cell while there are no values.
-fn add_windows(row: &mut Row, state: &ProviderState, now_sec: i64, now_ms: i64, stale_ms: i64, five_hour: bool, weekly: bool) {
+fn windows(state: &ProviderState, now_sec: i64, now_ms: i64, stale_ms: i64, five_hour: bool, weekly: bool) -> Vec<Cell> {
     if state.windows.is_empty() {
-        row.cells.push(Cell::status(state.status.as_deref().unwrap_or("—")));
-        return;
+        return vec![Cell::status(state.status.as_deref().unwrap_or("—"))];
     }
     let dim = state.failing || state.updated_at_ms == 0 || now_ms - state.updated_at_ms > stale_ms;
+    let mut cells = Vec::new();
     for w in fmt::ordered(&state.windows) {
         if (w.duration_mins == Some(FIVE_HOUR_MINS) && !five_hour) || (w.duration_mins == Some(WEEK_MINS) && !weekly) {
             continue;
@@ -721,8 +735,9 @@ fn add_windows(row: &mut Row, state: &ProviderState, now_sec: i64, now_ms: i64, 
         if dim {
             cell.value_color = color::dimmed(cell.value_color);
         }
-        row.cells.push(cell);
+        cells.push(cell);
     }
+    cells
 }
 
 /// "HF 7,747 11d22h": remaining credits and the time until the monthly refill.
@@ -752,21 +767,31 @@ mod tests {
     }
 
     #[test]
-    fn mini_labels_only_a_second_window_of_the_same_provider() {
-        let labels = |row: &Row| row.cells.iter().map(|c| c.label.clone()).collect::<Vec<_>>();
+    fn mini_line_keeps_provider_order_with_a_dot_before_each() {
+        let credits = Cell { value: "7,113".into(), reset: "10d2h".into(), ..Default::default() };
+        let line = mini_line(vec![
+            (color::CODEX, vec![window("W")]),
+            (color::CLAUDE, vec![Cell::status("연결 필요")]),
+            (color::HIGGSFIELD, vec![credits]),
+        ]);
+        assert_eq!(line.name, None);
+        let marks = line.cells.iter().map(|c| (c.label.clone(), c.label_color)).collect::<Vec<_>>();
+        assert_eq!(marks, [(Label::Dot, color::CODEX), (Label::Dot, color::CLAUDE), (Label::Dot, color::HIGGSFIELD)]);
+        assert_eq!(line.cells[1].status.as_deref(), Some("연결 필요"));
+        assert!(line.cells.iter().all(|c| c.reset.is_empty()));
+    }
 
-        let mut claude = Row { name: Some(Label::Dot), name_color: 0, cells: vec![window("W")] };
-        minify(&mut claude);
-        assert_eq!(labels(&claude), [Label::None]);
-        assert!(claude.cells.iter().all(|c| c.reset.is_empty()));
+    #[test]
+    fn mini_line_labels_only_a_second_window_of_the_same_provider() {
+        let line = mini_line(vec![(color::CLAUDE, vec![window("5h"), window("W")])]);
+        let labels = line.cells.iter().map(|c| c.label.clone()).collect::<Vec<_>>();
+        assert_eq!(labels, [Label::Dot, Label::Plain("W".into())]);
+        assert_eq!(line.cells[1].label_color, color::LABEL);
+    }
 
-        let mut both = Row { name: Some(Label::Dot), name_color: 0, cells: vec![window("5h"), window("W")] };
-        minify(&mut both);
-        assert_eq!(labels(&both), [Label::None, Label::Plain("W".into())]);
-
-        let credits = Cell { label: Label::Dot, value: "7,113".into(), ..Default::default() };
-        let mut codex = Row { name: Some(Label::Dot), name_color: 0, cells: vec![window("W"), credits] };
-        minify(&mut codex);
-        assert_eq!(labels(&codex), [Label::None, Label::Dot]);
+    #[test]
+    fn mini_line_without_providers_is_empty() {
+        assert!(mini_line(Vec::new()).cells.is_empty());
+        assert!(mini_line(vec![(color::CLAUDE, Vec::new())]).cells.is_empty());
     }
 }

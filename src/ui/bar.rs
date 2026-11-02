@@ -6,6 +6,10 @@
 //! ```
 //! Each line is a name followed by slots. Slot k starts at the same x on every line and its
 //! label, value and countdown columns have shared widths, so the lines read as a table.
+//! The mini style is one nameless line, a provider's dot before its first value:
+//! ```text
+//! ● 41%  ● 96%  ● 7,701
+//! ```
 
 use super::gdip::{Canvas, Font};
 use windows_sys::Win32::Graphics::GdiPlus::RectF;
@@ -77,7 +81,8 @@ impl Label {
     }
 }
 
-/// A slot: label, bold value, countdown ("W 94% 6d0h", "HF 7,747 11d22h"), or a muted status.
+/// A slot: label, bold value, countdown ("W 94% 6d0h", "HF 7,747 11d22h"), or a label and a
+/// muted status.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Cell {
     pub label: Label,
@@ -176,7 +181,9 @@ pub fn measure(rows: &[Row], canvas: &Canvas, fonts: &Fonts) -> Layout {
     for row in rows {
         for (k, cell) in row.cells.iter().enumerate() {
             if let Some(status) = &cell.status {
-                status_w[k] = status_w[k].max(canvas.text_width(status, &fonts.regular));
+                let label_w = cell.label.width(canvas, fonts);
+                let label_w = if label_w > 0.0 { label_w + LABEL_GAP * s } else { 0.0 };
+                status_w[k] = status_w[k].max(label_w + canvas.text_width(status, &fonts.regular));
                 continue;
             }
             layout.label_w[k] = layout.label_w[k].max(cell.label.width(canvas, fonts));
@@ -217,7 +224,10 @@ pub fn paint(rows: &[Row], layout: &Layout, canvas: &Canvas, fonts: &Fonts) {
         for (k, cell) in row.cells.iter().enumerate() {
             let x = layout.slot_x[k];
             if let Some(status) = &cell.status {
-                canvas.draw_text(status, &fonts.regular, color::MUTED, x, y);
+                cell.label.draw(canvas, fonts, cell.label_color, x, y);
+                let label_w = cell.label.width(canvas, fonts);
+                let text_x = if label_w > 0.0 { x + label_w + LABEL_GAP * s } else { x };
+                canvas.draw_text(status, &fonts.regular, color::MUTED, text_x, y);
                 continue;
             }
             // Label, value and countdown each start at the same x on every line.
