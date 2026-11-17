@@ -7,7 +7,7 @@
 //! browser runs. A refused connection is not retried until the browser is started again.
 
 use crate::cdp::{Cdp, CdpError, Handshake};
-use crate::model::{self, CLAUDE_WINDOWS};
+use crate::model;
 use crate::paths;
 use crate::poller::Source;
 use crate::util::{self, JsonExt};
@@ -46,7 +46,7 @@ const SCRIPT: &str = "(async () => {
       if (org) {
         const u = await fetch('/api/organizations/' + org.uuid + '/usage');
         out.usageStatus = u.status;
-        if (u.ok) { const j = await u.json(); out.five_hour = j.five_hour || null; out.seven_day = j.seven_day || null; }
+        if (u.ok) { const j = await u.json(); out.limits = j.limits; }
       }
     }
   } catch (e) { out.error = String((e && e.message) || e); }
@@ -60,7 +60,7 @@ pub fn parse_result(result: &Map<String, Value>) -> Result<Map<String, Value>, (
     }
     match result.i64_of("orgStatus").unwrap_or(0) {
         200 => {}
-        401 | 403 => return Err(("로그인 필요", "Aside 브라우저에서 claude.ai에 로그인하세요".into())),
+        401 | 403 => return Err(("로그인해주세요", "Aside 브라우저에서 claude.ai에 로그인하세요".into())),
         other => return Err(("연결 실패", format!("claude.ai 응답 {other}"))),
     }
     let Some(usage_status) = result.i64_of("usageStatus") else {
@@ -69,24 +69,11 @@ pub fn parse_result(result: &Map<String, Value>) -> Result<Map<String, Value>, (
     if usage_status != 200 {
         return Err(("연결 실패", format!("claude.ai 사용량 응답 {usage_status}")));
     }
-    // A window the response does not report (null) no longer exists for this account.
-    let mut observed = Map::new();
-    for (key, _) in CLAUDE_WINDOWS {
-        match result.obj(key) {
-            Some(window) => {
-                if let Some(entry) = model::claude_entry(window.f64_of("utilization"), window.get("resets_at")) {
-                    observed.insert(key.into(), entry);
-                }
-            }
-            None => {
-                observed.insert(key.into(), Value::Null);
-            }
-        }
-    }
-    if observed.values().all(Value::is_null) {
-        return Err(("데이터 없음", "claude.ai 응답에 사용량이 없습니다".into()));
-    }
-    Ok(observed)
+    // An empty limits array is authoritative absence, not a reason to retain an old quota.
+    result
+        .get("limits")
+        .and_then(model::parse_claude_limits)
+        .ok_or_else(|| ("데이터 없음", "claude.ai 응답의 사용량 형식을 확인할 수 없습니다".into()))
 }
 
 /// Port and browser path from `DevToolsActivePort`. The path changes with every browser start.
@@ -210,7 +197,7 @@ impl ClaudeWeb {
         }
         if let Link::Asking(_, handshake) = &mut self.link {
             match handshake.progress(CONSENT_WAIT) {
-                Ok(false) => return Err(("허용 필요", "Aside의 '원격 디버깅을 허용하시겠습니까?' 창에서 허용을 누르세요".into())),
+                Ok(false) => return Err(("로그인해주세요", "Aside의 '원격 디버깅을 허용하시겠습니까?' 창에서 허용을 누르세요".into())),
                 Ok(true) => {
                     let Link::Asking(endpoint, handshake) = std::mem::replace(&mut self.link, Link::Closed) else { unreachable!() };
                     let cdp = handshake.into_cdp(REPLY_TIMEOUT).map_err(|e| ("연결 실패", e.to_string()))?;
@@ -271,28 +258,32 @@ mod tests {
     fn usage_becomes_cache_entries() {
         let result = obj(json!({
             "orgStatus": 200, "usageStatus": 200,
-            "five_hour": { "utilization": 19.0, "resets_at": "2026-10-27T07:40:00.312+00:00" },
-            "seven_day": { "utilization": 16.0, "resets_at": "2026-10-28T11:00:00+00:00" }
+            "limits": [
+                {"kind":"weekly_scoped","percent":19.0,"resets_at":"2026-10-27T07:40:00.312+00:00","scope":{"model":{"display_name":"Fable"}}},
+                {"kind":"weekly_all","percent":16.0,"resets_at":"2026-10-28T11:00:00+00:00"}
+            ]
         }));
         let observed = parse_result(&result).unwrap();
-        assert_eq!(observed["five_hour"]["usedPercent"].as_f64(), Some(19.0));
+        assert_eq!(observed["fable"]["usedPercent"].as_f64(), Some(19.0));
         assert!(observed["seven_day"]["resetsAt"].as_i64().is_some());
     }
 
     #[test]
-    fn a_window_reported_as_null_is_marked_gone() {
+    fn an_absent_fable_window_is_marked_gone() {
         let result = obj(json!({
-            "orgStatus": 200, "usageStatus": 200, "five_hour": null,
-            "seven_day": { "utilization": 18.0, "resets_at": "2026-11-04T11:00:00+00:00" }
+            "orgStatus": 200, "usageStatus": 200,
+            "limits": [{"kind":"weekly_all","percent":18.0,"resets_at":"2026-11-04T11:00:00+00:00"}]
         }));
         let observed = parse_result(&result).unwrap();
-        assert!(observed["five_hour"].is_null());
+        assert!(observed["fable"].is_null());
         assert_eq!(observed["seven_day"]["usedPercent"].as_f64(), Some(18.0));
+        let empty = parse_result(&obj(json!({"orgStatus":200,"usageStatus":200,"limits":[]}))).unwrap();
+        assert!(empty.values().all(Value::is_null));
     }
 
     #[test]
     fn problems_map_to_bar_statuses() {
-        assert_eq!(parse_result(&obj(json!({ "orgStatus": 403 }))).unwrap_err().0, "로그인 필요");
+        assert_eq!(parse_result(&obj(json!({ "orgStatus": 403 }))).unwrap_err().0, "로그인해주세요");
         assert_eq!(parse_result(&obj(json!({ "orgStatus": 200 }))).unwrap_err().0, "구독 없음");
         assert_eq!(parse_result(&obj(json!({ "orgStatus": 200, "usageStatus": 500 }))).unwrap_err().0, "연결 실패");
         assert_eq!(parse_result(&obj(json!({ "error": "offline" }))).unwrap_err().0, "연결 실패");

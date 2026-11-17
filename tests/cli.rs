@@ -62,13 +62,16 @@ fn now() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64
 }
 
-fn input(five_hour: (f64, i64), seven_day: (f64, i64)) -> Value {
+fn input(fable: (f64, i64), seven_day: (f64, i64)) -> Value {
+    let reset = |seconds| chrono::DateTime::from_timestamp(seconds, 0).unwrap().to_rfc3339();
     json!({
         "session_id": "s", "prompt": "never logged",
         "model": { "display_name": "Opus" },
         "rate_limits": {
-            "five_hour": { "used_percentage": five_hour.0, "resets_at": five_hour.1 },
-            "seven_day": { "used_percentage": seven_day.0, "resets_at": seven_day.1 }
+            "limits": [
+                { "kind":"weekly_all", "percent":seven_day.0, "resets_at":reset(seven_day.1) },
+                { "kind":"weekly_scoped", "percent":fable.0, "resets_at":reset(fable.1), "scope":{"model":{"display_name":"Fable"}} }
+            ]
         }
     })
 }
@@ -88,13 +91,16 @@ fn statusline_caches_rate_limits_and_prints_remaining_quota() {
     let text = String::from_utf8(out.stdout).unwrap();
     let plain: String =
         text.split('\x1b').enumerate().map(|(i, s)| if i == 0 { s } else { s.split_once('m').map(|p| p.1).unwrap_or("") }).collect();
-    assert!(plain.contains("CC  5h 76%"), "{plain}");
-    assert!(plain.contains("W 59%"), "{plain}");
+    assert!(plain.contains("CC  W 59%"), "{plain}");
+    assert!(plain.contains("F 76%"), "{plain}");
+    assert!(!plain.contains("5h"), "{plain}");
     let lines: Vec<&str> = plain.lines().collect();
     assert!(lines[0].starts_with("CO") && lines[1].starts_with("HF") && lines[2].starts_with("CC"), "{plain}");
 
     let cache = sb.cache();
-    assert_eq!(cache["windows"]["five_hour"]["usedPercent"].as_f64(), Some(24.0));
+    assert_eq!(cache["windows"]["fable"]["usedPercent"].as_f64(), Some(24.0));
+    assert_eq!(cache["windows"]["seven_day"]["usedPercent"].as_f64(), Some(41.0));
+    assert!(cache["windows"].get("five_hour").is_none());
     assert_eq!(cache["source"], "Claude Code");
     assert!(!fs::read_to_string(sb.data("claude.json")).unwrap().contains("never logged"));
 }
@@ -113,10 +119,10 @@ fn windows_only_move_forward_across_sessions() {
     let reset = now() + 3600;
     sb.statusline(&input((30.0, reset), (40.0, reset + 86400)));
     sb.statusline(&input((20.0, reset + 30), (40.0, reset + 86400)));
-    assert_eq!(sb.cache()["windows"]["five_hour"]["usedPercent"].as_f64(), Some(30.0));
+    assert_eq!(sb.cache()["windows"]["fable"]["usedPercent"].as_f64(), Some(30.0));
     sb.statusline(&input((2.0, reset + 18000), (41.0, reset + 86400)));
     let cache = sb.cache();
-    assert_eq!(cache["windows"]["five_hour"]["usedPercent"].as_f64(), Some(2.0));
+    assert_eq!(cache["windows"]["fable"]["usedPercent"].as_f64(), Some(2.0));
     assert_eq!(cache["windows"]["seven_day"]["usedPercent"].as_f64(), Some(41.0));
 }
 
@@ -126,6 +132,28 @@ fn malformed_input_never_fails_the_statusline() {
     for input in [&b"not json"[..], b"", b"[1,2]", b"{\"rate_limits\": 5}"] {
         assert!(sb.run(&["claude-statusline"], input).status.success());
     }
+}
+
+#[test]
+fn malformed_limits_preserve_cache_and_obsolete_five_hour_is_not_displayed() {
+    let sb = Sandbox::new("limits-contract");
+    fs::write(
+        sb.data("claude.json"),
+        json!({
+            "updatedAt":now()*1000,
+            "windows":{"five_hour":{"usedPercent":99}, "seven_day":{"usedPercent":40}}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let out = sb.run(&["print"], b"");
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("5h"));
+    let before = fs::read(sb.data("claude.json")).unwrap();
+    sb.statusline(&json!({"rate_limits":{"limits":[{"kind":"weekly_all","percent":"bad","resets_at":null}]}}));
+    assert_eq!(fs::read(sb.data("claude.json")).unwrap(), before);
+    sb.statusline(&input((21.0, now() + 86400), (41.0, now() + 86400)));
+    assert!(sb.cache()["windows"].get("five_hour").is_none());
+    assert_eq!(sb.cache()["windows"]["fable"]["usedPercent"], 21.0);
 }
 
 #[test]

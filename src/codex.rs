@@ -151,6 +151,7 @@ pub fn parse_limits(limits: &Map<String, Value>, now_ms: i64) -> ProviderState {
                 duration_mins: window.i64_of("windowDurationMins"),
                 used_percent: Some(used.clamp(0.0, 100.0)),
                 resets_at: window.i64_of("resetsAt"),
+                ..Default::default()
             });
         }
     }
@@ -221,7 +222,10 @@ mod tests {
             "rateLimitsByLimitId": { "codex": { "primary": { "usedPercent": 6, "windowDurationMins": 10080, "resetsAt": 1793600909 } } }
         });
         let state = parse_limits(limits.as_object().unwrap(), 5);
-        assert_eq!(state.windows, vec![UsageWindow { duration_mins: Some(10080), used_percent: Some(6.0), resets_at: Some(1793600909) }]);
+        assert_eq!(
+            state.windows,
+            vec![UsageWindow { duration_mins: Some(10080), used_percent: Some(6.0), resets_at: Some(1793600909), ..Default::default() }]
+        );
         assert_eq!(state.updated_at_ms, 5);
         assert!(state.status.is_none());
     }

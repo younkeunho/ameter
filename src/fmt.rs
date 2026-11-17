@@ -1,10 +1,13 @@
 //! Compact text for the bar and the terminal: "5h", "W", "94%", "1h05m", "7,747".
 
-use crate::model::{FIVE_HOUR_MINS, ProviderState, UsageWindow, WEEK_MINS};
+use crate::model::{FIVE_HOUR_MINS, ProviderState, UsageWindow, WEEK_MINS, WindowKind};
 
-/// Bar label of a window: 5h, W, or the raw duration (2d, 3h, 45m).
-pub fn label(mins: Option<i64>) -> String {
-    match mins {
+/// Fable keeps its own label even though both Claude buckets last a week.
+pub fn label(window: &UsageWindow) -> String {
+    if window.kind == WindowKind::Fable {
+        return "F".into();
+    }
+    match window.duration_mins {
         None => "?".into(),
         Some(FIVE_HOUR_MINS) => "5h".into(),
         Some(WEEK_MINS) => "W".into(),
@@ -73,12 +76,13 @@ pub fn countdown(w: &UsageWindow, now_sec: i64) -> Option<String> {
     w.resets_at.filter(|r| *r > now_sec).map(|r| short(r - now_sec))
 }
 
-/// Display order: 5-hour, weekly, anything else.
+/// Display order: 5-hour (Codex), weekly, Fable, anything else.
 pub fn ordered(windows: &[UsageWindow]) -> Vec<&UsageWindow> {
-    let rank = |w: &&UsageWindow| match w.duration_mins {
-        Some(FIVE_HOUR_MINS) => 0,
-        Some(WEEK_MINS) => 1,
-        _ => 2,
+    let rank = |w: &&UsageWindow| match (w.kind, w.duration_mins) {
+        (WindowKind::Fable, _) => 2,
+        (_, Some(FIVE_HOUR_MINS)) => 0,
+        (_, Some(WEEK_MINS)) => 1,
+        _ => 3,
     };
     let mut list: Vec<&UsageWindow> = windows.iter().collect();
     list.sort_by_key(rank);
@@ -108,7 +112,7 @@ pub fn terminal_line(name: &str, state: &ProviderState, now_sec: i64, ansi: bool
     }
     for (i, w) in ordered(&state.windows).into_iter().enumerate() {
         line.push_str(&if i == 0 { " ".to_string() } else { paint(DIM, " · ") });
-        line.push_str(&paint(DIM, &label(w.duration_mins)));
+        line.push_str(&paint(DIM, &label(w)));
         line.push(' ');
         match current_used(state, w, now_sec) {
             None => line.push('—'),
@@ -135,12 +139,14 @@ mod tests {
 
     #[test]
     fn labels() {
-        assert_eq!(label(Some(300)), "5h");
-        assert_eq!(label(Some(10080)), "W");
-        assert_eq!(label(Some(2880)), "2d");
-        assert_eq!(label(Some(180)), "3h");
-        assert_eq!(label(Some(45)), "45m");
-        assert_eq!(label(None), "?");
+        let timed = |mins| label(&UsageWindow { duration_mins: mins, ..Default::default() });
+        assert_eq!(timed(Some(300)), "5h");
+        assert_eq!(timed(Some(10080)), "W");
+        assert_eq!(timed(Some(2880)), "2d");
+        assert_eq!(timed(Some(180)), "3h");
+        assert_eq!(timed(Some(45)), "45m");
+        assert_eq!(timed(None), "?");
+        assert_eq!(label(&UsageWindow { kind: WindowKind::Fable, duration_mins: Some(WEEK_MINS), ..Default::default() }), "F");
     }
 
     #[test]
@@ -181,28 +187,39 @@ mod tests {
         let now = 1_000_000;
         let state = ProviderState {
             windows: vec![
-                UsageWindow { duration_mins: Some(10080), used_percent: Some(16.0), resets_at: Some(now + 86400 + 4 * 3600) },
-                UsageWindow { duration_mins: Some(300), used_percent: Some(24.0), resets_at: Some(now + 3600 + 13 * 60) },
+                UsageWindow {
+                    duration_mins: Some(10080),
+                    used_percent: Some(16.0),
+                    resets_at: Some(now + 86400 + 4 * 3600),
+                    ..Default::default()
+                },
+                UsageWindow {
+                    kind: WindowKind::Fable,
+                    duration_mins: Some(WEEK_MINS),
+                    used_percent: Some(24.0),
+                    resets_at: Some(now + 3600 + 13 * 60),
+                },
             ],
             ..Default::default()
         };
-        assert_eq!(terminal_line("CC", &state, now, false), "CC  5h 76% (1h13m) · W 84% (1d4h)");
+        assert_eq!(terminal_line("CC", &state, now, false), "CC  W 84% (1d4h) · F 76% (1h13m)");
 
         // Reset at now - 60: read before it, unknown; read after it with no newer window, unused.
-        let past_reset = vec![UsageWindow { duration_mins: Some(300), used_percent: Some(50.0), resets_at: Some(now - 60) }];
+        let past_reset =
+            vec![UsageWindow { duration_mins: Some(300), used_percent: Some(50.0), resets_at: Some(now - 60), ..Default::default() }];
         let read_before = ProviderState { windows: past_reset.clone(), updated_at_ms: (now - 120) * 1000, ..Default::default() };
         assert_eq!(terminal_line("CC", &read_before, now, false), "CC  5h —");
         let read_after = ProviderState { windows: past_reset, updated_at_ms: (now - 30) * 1000, ..Default::default() };
         assert_eq!(terminal_line("CC", &read_after, now, false), "CC  5h 100%");
 
         let not_started = ProviderState {
-            windows: vec![UsageWindow { duration_mins: Some(300), used_percent: Some(0.0), resets_at: None }],
+            windows: vec![UsageWindow { duration_mins: Some(300), used_percent: Some(0.0), resets_at: None, ..Default::default() }],
             ..Default::default()
         };
         assert_eq!(terminal_line("CC", &not_started, now, false), "CC  5h 100%");
 
         let unknown = ProviderState {
-            windows: vec![UsageWindow { duration_mins: Some(300), used_percent: None, resets_at: Some(now + 60) }],
+            windows: vec![UsageWindow { duration_mins: Some(300), used_percent: None, resets_at: Some(now + 60), ..Default::default() }],
             ..Default::default()
         };
         assert_eq!(terminal_line("CC", &unknown, now, false), "CC  5h —");

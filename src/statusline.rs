@@ -3,7 +3,7 @@
 //! Contract with Claude Code: it always exits 0 and never logs prompt content.
 
 use crate::fmt;
-use crate::model::{self, CLAUDE_WINDOWS};
+use crate::model;
 use crate::paths;
 use crate::process;
 use crate::util::{self, JsonExt};
@@ -52,13 +52,7 @@ pub fn run() {
 /// `rate_limits` is absent until the session's first API response; then it is merged in.
 pub fn cache_rate_limits(input: &Map<String, Value>, now_ms: i64) {
     let Some(rate_limits) = input.obj("rate_limits") else { return };
-    let mut observed = Map::new();
-    for (key, _) in CLAUDE_WINDOWS {
-        let Some(window) = rate_limits.obj(key) else { continue };
-        if let Some(entry) = model::claude_entry(window.f64_of("used_percentage"), window.get("resets_at")) {
-            observed.insert(key.into(), entry);
-        }
-    }
+    let Some(observed) = rate_limits.get("limits").and_then(model::parse_claude_limits) else { return };
     model::merge_claude(&observed, false, model::SOURCE_STATUSLINE, now_ms);
 }
 

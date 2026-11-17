@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! CO  W  94% 6d0h    HF 7,747 11d22h
-//! CC  5h 76% 1h13m   W  84%   1d4h
+//! CC  W  84% 1d4h    F  76%   1d4h
 //! ```
 //! Each line is a name followed by slots. Slot k starts at the same x on every line and its
 //! label, value and countdown columns have shared widths, so the lines read as a table.
@@ -45,7 +45,7 @@ pub mod color {
     }
 }
 
-/// What stands before a value: nothing, a window label ("W", "5h"), a provider name ("CO", "HF"),
+/// What stands before a value: nothing, a window label ("W", "F", "5h"), a provider name ("CO", "HF"),
 /// or, in the mini style, a dot in the provider's color.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Label {

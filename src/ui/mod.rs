@@ -16,7 +16,7 @@ use crate::claude_web::{ClaudeWeb, WebStatus};
 use crate::codex::Codex;
 use crate::fmt;
 use crate::higgsfield::Higgsfield;
-use crate::model::{self, FIVE_HOUR_MINS, ProviderState, WEEK_MINS};
+use crate::model::{self, ProviderState, WindowKind};
 use crate::paths;
 use crate::poller::Poller;
 use crate::util::{self, JsonExt, wide};
@@ -48,7 +48,7 @@ const CLAUDE_STATUSLINE_STALE_MS: i64 = 30 * 60 * 1000;
 const MENU_REFRESH: usize = 1;
 const MENU_CODEX: usize = 2;
 const MENU_CLAUDE_WEEKLY: usize = 3;
-const MENU_CLAUDE_FIVE_HOUR: usize = 4;
+const MENU_CLAUDE_FABLE: usize = 4;
 const MENU_HIGGSFIELD: usize = 5;
 const MENU_MINI: usize = 6;
 const MENU_EXIT: usize = 9;
@@ -58,7 +58,7 @@ const MENU_EXIT: usize = 9;
 struct Display {
     codex: bool,
     claude_weekly: bool,
-    claude_five_hour: bool,
+    claude_fable: bool,
     higgsfield: bool,
     /// Mini style: one line of Codex, Claude and Higgsfield, each led by a dot in its color, without
     /// countdowns; only a provider's second window keeps its label.
@@ -67,30 +67,37 @@ struct Display {
 
 impl Display {
     fn claude(&self) -> bool {
-        self.claude_weekly || self.claude_five_hour
+        self.claude_weekly || self.claude_fable
     }
 
     fn load() -> Display {
         let json = util::read_json_object(&paths::display_settings()).unwrap_or_default();
+        Self::from_json(&json)
+    }
+
+    fn from_json(json: &serde_json::Map<String, serde_json::Value>) -> Display {
         let get = |key: &str| json.bool_of(key).unwrap_or(true);
         Display {
             codex: get("codex"),
             claude_weekly: get("claudeWeekly"),
-            claude_five_hour: get("claudeFiveHour"),
+            claude_fable: get("claudeFable"),
             higgsfield: get("higgsfield"),
             mini: json.bool_of("mini").unwrap_or(false),
         }
     }
 
-    fn save(&self) {
-        let json = json!({
+    fn to_json(self) -> serde_json::Value {
+        json!({
             "codex": self.codex,
             "claudeWeekly": self.claude_weekly,
-            "claudeFiveHour": self.claude_five_hour,
+            "claudeFable": self.claude_fable,
             "higgsfield": self.higgsfield,
             "mini": self.mini,
-        });
-        if let Err(e) = util::write_json(&paths::display_settings(), &json) {
+        })
+    }
+
+    fn save(&self) {
+        if let Err(e) = util::write_json(&paths::display_settings(), &self.to_json()) {
             util::log(&format!("display settings save failed: {e}"));
         }
     }
@@ -398,8 +405,8 @@ fn show_menu(hwnd: HWND) {
     let command = unsafe {
         let menu = CreatePopupMenu();
         let claude = CreatePopupMenu();
-        AppendMenuW(claude, MF_STRING | check(display.claude_weekly), MENU_CLAUDE_WEEKLY, wide("주간").as_ptr());
-        AppendMenuW(claude, MF_STRING | check(display.claude_five_hour), MENU_CLAUDE_FIVE_HOUR, wide("5시간").as_ptr());
+        AppendMenuW(claude, MF_STRING | check(display.claude_weekly), MENU_CLAUDE_WEEKLY, wide("주간 (W)").as_ptr());
+        AppendMenuW(claude, MF_STRING | check(display.claude_fable), MENU_CLAUDE_FABLE, wide("페이블 (F)").as_ptr());
         AppendMenuW(menu, MF_STRING, MENU_REFRESH, wide("새로고침").as_ptr());
         AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
         AppendMenuW(menu, MF_STRING | check(display.codex), MENU_CODEX, wide("코덱스").as_ptr());
@@ -471,7 +478,7 @@ impl App {
             }
             MENU_CODEX => self.display.codex = !self.display.codex,
             MENU_CLAUDE_WEEKLY => self.display.claude_weekly = !self.display.claude_weekly,
-            MENU_CLAUDE_FIVE_HOUR => self.display.claude_five_hour = !self.display.claude_five_hour,
+            MENU_CLAUDE_FABLE => self.display.claude_fable = !self.display.claude_fable,
             MENU_HIGGSFIELD => self.display.higgsfield = !self.display.higgsfield,
             MENU_MINI => self.display.mini = !self.display.mini,
             _ => return,
@@ -514,28 +521,13 @@ impl App {
         unsafe { Shell_NotifyIconW(action, &data) };
     }
 
-    /// Claude as shown: the cache, with a status explaining whichever source is missing.
-    fn claude_view(&self, web: Option<&WebStatus>) -> ProviderState {
-        let mut state = self.claude.clone();
-        if state.windows.is_empty() {
-            let web_source = web.is_none_or(|w| w.available);
-            state.status = Some(match web {
-                Some(w) if w.available && !w.ok => w.status.clone().unwrap_or_else(|| "연결 실패".into()),
-                _ if web_source => "확인 중…".into(),
-                _ if self.claude_installed => "대기 중".into(),
-                _ => "연결 필요".into(),
-            });
-        }
-        state
-    }
-
     fn build_rows(&self) -> (Vec<Row>, String) {
         let now_ms = util::now_ms();
         let now_sec = now_ms / 1000;
         let shared = self.shared.lock().map(|s| (s.codex.clone(), s.higgsfield.clone(), s.web.clone()));
         let (codex, higgsfield, web) = shared.unwrap_or_default();
-        let claude = self.claude_view(web.as_ref());
         let claude_stale = if web.as_ref().is_some_and(|w| w.available) { CLAUDE_WEB_STALE_MS } else { CLAUDE_STATUSLINE_STALE_MS };
+        let claude = claude_view(&self.claude, web.as_ref(), self.claude_installed, now_ms, claude_stale);
 
         let d = self.display;
         let mut rows = Vec::new();
@@ -545,7 +537,7 @@ impl App {
                 providers.push((color::CODEX, windows(&codex, now_sec, now_ms, CODEX_STALE_MS, true, true)));
             }
             if d.claude() {
-                providers.push((color::CLAUDE, windows(&claude, now_sec, now_ms, claude_stale, d.claude_five_hour, d.claude_weekly)));
+                providers.push((color::CLAUDE, windows(&claude, now_sec, now_ms, claude_stale, d.claude_weekly, d.claude_fable)));
             }
             if d.higgsfield {
                 providers.push((color::HIGGSFIELD, vec![credits_cell(Label::None, &higgsfield, now_sec, now_ms)]));
@@ -567,7 +559,7 @@ impl App {
             }
             if d.claude() {
                 let mut bottom = Row { name: Some(Label::Name("CC")), name_color: color::CLAUDE, cells: Vec::new() };
-                bottom.cells.extend(windows(&claude, now_sec, now_ms, claude_stale, d.claude_five_hour, d.claude_weekly));
+                bottom.cells.extend(windows(&claude, now_sec, now_ms, claude_stale, d.claude_weekly, d.claude_fable));
                 rows.push(bottom);
             }
         }
@@ -691,6 +683,30 @@ impl App {
     }
 }
 
+/// Claude's cached percentages are only useful while fresh. A failed web read must not leave
+/// an old percentage on the meter indefinitely, but a recent statusline update is still usable.
+/// Keep the cache intact so a successful refresh restores the values without losing history.
+fn claude_view(cached: &ProviderState, web: Option<&WebStatus>, installed: bool, now_ms: i64, stale_ms: i64) -> ProviderState {
+    let mut state = cached.clone();
+    let stale = state.updated_at_ms <= 0 || now_ms.saturating_sub(state.updated_at_ms) > stale_ms;
+    state.failing = stale || web.is_some_and(|w| w.available && !w.ok);
+    if stale {
+        state.windows.clear();
+    }
+    if state.windows.is_empty() {
+        let web_source = web.is_none_or(|w| w.available);
+        state.status = Some(match web {
+            Some(w) if w.available && !w.ok => w.status.clone().unwrap_or_else(|| "연결 실패".into()),
+            _ if !cached.windows.is_empty() => "갱신 필요".into(),
+            Some(w) if w.ok => "데이터 없음".into(),
+            _ if web_source => "확인 중…".into(),
+            _ if installed => "대기 중".into(),
+            _ => "연결 필요".into(),
+        });
+    }
+    state
+}
+
 /// Mini style: one line of providers in the given order, without countdowns. A dot in the
 /// provider's color takes the place of its first value's label; a second window of the same
 /// provider keeps its label, so the two stay apart.
@@ -700,7 +716,10 @@ fn mini_line(providers: Vec<(u32, Vec<Cell>)>) -> Row {
         for (i, mut cell) in group.into_iter().enumerate() {
             cell.reset.clear();
             if i == 0 {
-                cell.label = Label::Dot;
+                // Fable-only mode still needs an F; otherwise it looks like the weekly bucket.
+                if cell.label != Label::Plain("F".into()) {
+                    cell.label = Label::Dot;
+                }
                 cell.label_color = dot_color;
             }
             cells.push(cell);
@@ -710,17 +729,20 @@ fn mini_line(providers: Vec<(u32, Vec<Cell>)>) -> Row {
 }
 
 /// "W 94% 6d0h" per window, or one status cell while there are no values.
-fn windows(state: &ProviderState, now_sec: i64, now_ms: i64, stale_ms: i64, five_hour: bool, weekly: bool) -> Vec<Cell> {
+fn windows(state: &ProviderState, now_sec: i64, now_ms: i64, stale_ms: i64, timed: bool, fable: bool) -> Vec<Cell> {
+    if !timed && !fable {
+        return Vec::new();
+    }
     if state.windows.is_empty() {
         return vec![Cell::status(state.status.as_deref().unwrap_or("—"))];
     }
     let dim = state.failing || state.updated_at_ms == 0 || now_ms - state.updated_at_ms > stale_ms;
     let mut cells = Vec::new();
     for w in fmt::ordered(&state.windows) {
-        if (w.duration_mins == Some(FIVE_HOUR_MINS) && !five_hour) || (w.duration_mins == Some(WEEK_MINS) && !weekly) {
+        if (w.kind == WindowKind::Timed && !timed) || (w.kind == WindowKind::Fable && !fable) {
             continue;
         }
-        let mut cell = Cell { label: Label::Plain(fmt::label(w.duration_mins)), ..Default::default() };
+        let mut cell = Cell { label: Label::Plain(fmt::label(w)), ..Default::default() };
         match fmt::current_used(state, w, now_sec) {
             None => {
                 cell.value = "—".into();
@@ -737,7 +759,7 @@ fn windows(state: &ProviderState, now_sec: i64, now_ms: i64, stale_ms: i64, five
         }
         cells.push(cell);
     }
-    cells
+    if cells.is_empty() { vec![Cell::status("데이터 없음")] } else { cells }
 }
 
 /// "HF 7,747 11d22h": remaining credits and the time until the monthly refill.
@@ -762,6 +784,149 @@ fn credits_cell(label: Label, state: &ProviderState, now_sec: i64, now_ms: i64) 
 mod tests {
     use super::*;
 
+    fn claude_cache(updated_at_ms: i64) -> ProviderState {
+        ProviderState {
+            windows: vec![model::UsageWindow {
+                duration_mins: Some(model::WEEK_MINS),
+                used_percent: Some(78.0),
+                resets_at: None,
+                ..Default::default()
+            }],
+            updated_at_ms,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn claude_stale_cache_shows_login_failure_in_both_styles_and_tooltip() {
+        let now = 10_000_000;
+        let cached = claude_cache(now - CLAUDE_WEB_STALE_MS - 1);
+        let web = WebStatus { available: true, ok: false, status: Some("로그인 필요".into()) };
+        let view = claude_view(&cached, Some(&web), true, now, CLAUDE_WEB_STALE_MS);
+        assert!(view.windows.is_empty());
+        assert!(view.failing);
+        assert_eq!(view.status.as_deref(), Some("로그인 필요"));
+        assert_eq!(cached.windows[0].used_percent, Some(78.0));
+        let cells = windows(&view, now / 1000, now, CLAUDE_WEB_STALE_MS, true, true);
+        assert_eq!(cells.len(), 1);
+        assert_eq!(cells[0].status.as_deref(), Some("로그인 필요"));
+        let mini = mini_line(vec![(color::CLAUDE, cells)]);
+        assert_eq!(mini.cells[0].status.as_deref(), Some("로그인 필요"));
+        assert_eq!(fmt::terminal_line("CC", &view, now / 1000, false), "CC  로그인 필요");
+    }
+
+    #[test]
+    fn claude_recent_cache_survives_web_failure_until_the_freshness_boundary() {
+        let now = 10_000_000;
+        let web = WebStatus { available: true, ok: false, status: Some("연결 실패".into()) };
+        for age in [0, CLAUDE_WEB_STALE_MS] {
+            let cached = claude_cache(now - age);
+            let view = claude_view(&cached, Some(&web), true, now, CLAUDE_WEB_STALE_MS);
+            assert_eq!(view.windows, cached.windows);
+            assert!(view.failing);
+            let cells = windows(&view, now / 1000, now, CLAUDE_WEB_STALE_MS, true, true);
+            assert_eq!(cells[0].value, "22%");
+            assert!(cells[0].status.is_none());
+        }
+    }
+
+    #[test]
+    fn claude_unknown_or_stale_timestamp_never_displays_a_percentage() {
+        let now = 10_000_000;
+        let web = WebStatus { available: true, ok: true, status: None };
+        for updated in [0, now - CLAUDE_WEB_STALE_MS - 1] {
+            let view = claude_view(&claude_cache(updated), Some(&web), true, now, CLAUDE_WEB_STALE_MS);
+            assert!(view.windows.is_empty());
+            assert_eq!(view.status.as_deref(), Some("갱신 필요"));
+        }
+        let cached = claude_cache(now - CLAUDE_STATUSLINE_STALE_MS - 1);
+        let view = claude_view(&cached, None, true, now, CLAUDE_STATUSLINE_STALE_MS);
+        assert!(view.windows.is_empty());
+        assert_eq!(view.status.as_deref(), Some("갱신 필요"));
+    }
+
+    #[test]
+    fn claude_new_observation_recovers_after_login_failure() {
+        let now = 10_000_000;
+        let web = WebStatus { available: true, ok: true, status: None };
+        let mut cached = claude_cache(now);
+        cached.windows[0].used_percent = Some(85.0);
+        let view = claude_view(&cached, Some(&web), true, now, CLAUDE_WEB_STALE_MS);
+        assert_eq!(view.windows, cached.windows);
+        assert!(!view.failing);
+        assert!(view.status.is_none());
+        let cells = windows(&view, now / 1000, now, CLAUDE_WEB_STALE_MS, true, true);
+        assert_eq!(cells[0].value, "15%");
+    }
+
+    #[test]
+    fn claude_without_cached_windows_explains_the_source_state() {
+        let cached = ProviderState::default();
+        let unavailable = WebStatus::default();
+        let failed = WebStatus { available: true, ok: false, status: None };
+        for (web, installed, expected) in [
+            (None, false, "확인 중…"),
+            (Some(&unavailable), true, "대기 중"),
+            (Some(&unavailable), false, "연결 필요"),
+            (Some(&failed), true, "연결 실패"),
+        ] {
+            let view = claude_view(&cached, web, installed, 10_000_000, CLAUDE_WEB_STALE_MS);
+            assert!(view.windows.is_empty());
+            assert_eq!(view.status.as_deref(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn weekly_and_fable_toggles_select_independent_values_even_with_the_same_duration() {
+        let now = 10_000_000;
+        let mut state = claude_cache(now);
+        state.windows.push(model::UsageWindow {
+            kind: WindowKind::Fable,
+            duration_mins: Some(model::WEEK_MINS),
+            used_percent: Some(32.0),
+            resets_at: None,
+        });
+        for (weekly, fable, labels, values) in [
+            (true, true, vec!["W", "F"], vec!["22%", "68%"]),
+            (true, false, vec!["W"], vec!["22%"]),
+            (false, true, vec!["F"], vec!["68%"]),
+            (false, false, vec![], vec![]),
+        ] {
+            let cells = windows(&state, now / 1000, now, CLAUDE_WEB_STALE_MS, weekly, fable);
+            assert_eq!(
+                cells.iter().map(|c| c.label.clone()).collect::<Vec<_>>(),
+                labels.iter().map(|s| Label::Plain((*s).into())).collect::<Vec<_>>()
+            );
+            assert_eq!(cells.iter().map(|c| c.value.as_str()).collect::<Vec<_>>(), values);
+        }
+        let cells = windows(&state, now / 1000, now, CLAUDE_WEB_STALE_MS, false, true);
+        let mini = mini_line(vec![(color::CLAUDE, cells)]);
+        assert_eq!(mini.cells[0].label, Label::Plain("F".into()));
+        assert_eq!(mini.cells[0].value, "68%");
+        assert_eq!(mini.cells[0].label_color, color::CLAUDE);
+    }
+
+    #[test]
+    fn fable_not_reported_by_the_server_is_not_shown_as_unused() {
+        let now = 10_000_000;
+        let cells = windows(&claude_cache(now), now / 1000, now, CLAUDE_WEB_STALE_MS, false, true);
+        assert_eq!(cells[0].status.as_deref(), Some("데이터 없음"));
+        assert!(cells[0].value.is_empty());
+    }
+
+    #[test]
+    fn claude_toggle_preferences_round_trip_without_the_removed_five_hour_setting() {
+        for (weekly, fable) in [(false, false), (false, true), (true, false), (true, true)] {
+            let input = json!({"claudeWeekly":weekly,"claudeFable":fable,"claudeFiveHour":!fable,"mini":true});
+            let display = Display::from_json(input.as_object().unwrap());
+            assert_eq!(display.claude(), weekly || fable);
+            let saved = display.to_json();
+            assert!(saved.get("claudeFiveHour").is_none());
+            let loaded = Display::from_json(saved.as_object().unwrap());
+            assert_eq!((loaded.claude_weekly, loaded.claude_fable, loaded.mini), (weekly, fable, true));
+        }
+    }
+
     fn window(label: &str) -> Cell {
         Cell { label: Label::Plain(label.into()), value: "90%".into(), reset: "3d6h".into(), ..Default::default() }
     }
@@ -783,9 +948,9 @@ mod tests {
 
     #[test]
     fn mini_line_labels_only_a_second_window_of_the_same_provider() {
-        let line = mini_line(vec![(color::CLAUDE, vec![window("5h"), window("W")])]);
+        let line = mini_line(vec![(color::CLAUDE, vec![window("W"), window("F")])]);
         let labels = line.cells.iter().map(|c| c.label.clone()).collect::<Vec<_>>();
-        assert_eq!(labels, [Label::Dot, Label::Plain("W".into())]);
+        assert_eq!(labels, [Label::Dot, Label::Plain("F".into())]);
         assert_eq!(line.cells[1].label_color, color::LABEL);
     }
 

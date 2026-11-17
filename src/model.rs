@@ -7,8 +7,16 @@ use serde_json::{Map, Value, json};
 pub const FIVE_HOUR_MINS: i64 = 300;
 pub const WEEK_MINS: i64 = 10080;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WindowKind {
+    #[default]
+    Timed,
+    Fable,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct UsageWindow {
+    pub kind: WindowKind,
     pub duration_mins: Option<i64>,
     pub used_percent: Option<f64>,
     /// Unix seconds.
@@ -65,6 +73,7 @@ pub fn load_codex() -> ProviderState {
     if let Some(windows) = cache.get("windows").and_then(Value::as_array) {
         for w in windows.iter().filter_map(Value::as_object) {
             state.windows.push(UsageWindow {
+                kind: WindowKind::Timed,
                 duration_mins: w.i64_of("durationMins"),
                 used_percent: w.f64_of("usedPercent"),
                 resets_at: w.i64_of("resetsAt"),
@@ -118,8 +127,8 @@ pub fn save_higgsfield(state: &ProviderState) {
 
 // ---------------------------------------------------------------- Claude cache
 
-/// Cache keys, as Claude Code and claude.ai name the windows.
-pub const CLAUDE_WINDOWS: [(&str, i64); 2] = [("five_hour", FIVE_HOUR_MINS), ("seven_day", WEEK_MINS)];
+/// Independent weekly buckets. Duration alone cannot distinguish Fable from the overall quota.
+pub const CLAUDE_WINDOWS: [(&str, WindowKind); 2] = [("seven_day", WindowKind::Timed), ("fable", WindowKind::Fable)];
 
 pub const SOURCE_WEB: &str = "claude.ai";
 pub const SOURCE_STATUSLINE: &str = "Claude Code";
@@ -130,18 +139,61 @@ pub fn load_claude() -> ProviderState {
     };
     let mut state = ProviderState { updated_at_ms: cache.i64_of("updatedAt").unwrap_or(0), ..Default::default() };
     if let Some(windows) = cache.obj("windows") {
-        for (key, mins) in CLAUDE_WINDOWS {
+        for (key, kind) in CLAUDE_WINDOWS {
             let Some(entry) = windows.obj(key) else { continue };
             let Some(used) = entry.f64_of("usedPercent") else { continue };
-            state.windows.push(UsageWindow { duration_mins: Some(mins), used_percent: Some(used), resets_at: entry.i64_of("resetsAt") });
+            state.windows.push(UsageWindow {
+                kind,
+                duration_mins: Some(WEEK_MINS),
+                used_percent: Some(used),
+                resets_at: entry.i64_of("resetsAt"),
+            });
         }
     }
     state
 }
 
+/// Current Claude usage API and statusline `limits` rows. Missing buckets are explicit nulls;
+/// malformed relevant data is not an observation and must not erase a known value.
+pub fn parse_claude_limits(limits: &Value) -> Option<Map<String, Value>> {
+    let rows = limits.as_array()?;
+    let mut observed: Map<String, Value> = CLAUDE_WINDOWS.into_iter().map(|(key, _)| (key.into(), Value::Null)).collect();
+    let mut exact_fable = false;
+    for row in rows {
+        let row = row.as_object()?;
+        let (key, exact) = match row.str_of("kind")? {
+            "weekly_all" => ("seven_day", false),
+            "weekly_scoped" => {
+                let Some(name) = row.obj("scope").and_then(|s| s.obj("model")).and_then(|m| m.str_of("display_name")) else { continue };
+                let lower = name.trim().to_ascii_lowercase();
+                let Some(rest) = lower.strip_prefix("fable") else { continue };
+                if rest.chars().next().is_some_and(|c| c.is_ascii_alphanumeric() || c == '_') {
+                    continue;
+                }
+                ("fable", rest.is_empty())
+            }
+            _ => continue,
+        };
+        let used = row.f64_of("percent").filter(|v| v.is_finite() && (0.0..=100.0).contains(v))?;
+        let reset = row.get("resets_at")?;
+        if !reset.is_null() && (!reset.is_string() || epoch_seconds(reset).is_none()) {
+            return None;
+        }
+        // Prefer the unified Fable bucket, otherwise keep the first family row in server order.
+        if !observed[key].is_null() && (key != "fable" || exact_fable || !exact) {
+            continue;
+        }
+        observed.insert(key.into(), claude_entry(Some(used), Some(reset))?);
+        if key == "fable" {
+            exact_fable = exact;
+        }
+    }
+    Some(observed)
+}
+
 /// One cache entry; None when the percentage is missing.
 pub fn claude_entry(used_percent: Option<f64>, resets_at: Option<&Value>) -> Option<Value> {
-    let used = used_percent?.clamp(0.0, 100.0);
+    let used = used_percent.filter(|p| p.is_finite())?.clamp(0.0, 100.0);
     let mut entry = Map::new();
     entry.insert("usedPercent".into(), util::number(used));
     if let Some(reset) = resets_at.and_then(epoch_seconds) {
@@ -211,8 +263,13 @@ pub fn compare_window(existing: Option<&Map<String, Value>>, incoming: &Map<Stri
 /// about the current one and is ignored.
 pub fn apply_windows(windows: &mut Map<String, Value>, observed: &Map<String, Value>, authoritative: bool, now_sec: i64) -> (bool, bool) {
     let mut accepted = false;
-    let mut changed = false;
+    let old_len = windows.len();
+    windows.retain(|key, _| CLAUDE_WINDOWS.iter().any(|(known, _)| key == known));
+    let mut changed = old_len != windows.len();
     for (key, incoming) in observed {
+        if !CLAUDE_WINDOWS.iter().any(|(known, _)| key == known) {
+            continue;
+        }
         match incoming {
             Value::Null if authoritative => {
                 accepted = true;
@@ -331,20 +388,18 @@ mod tests {
     fn a_window_claude_ai_no_longer_reports_is_dropped() {
         let now = 20_000;
         let mut windows = Map::new();
-        windows.insert("five_hour".into(), Value::Object(entry(0.0, now - 3600)));
+        windows.insert("fable".into(), Value::Object(entry(0.0, now + 3600)));
         windows.insert("seven_day".into(), Value::Object(entry(18.0, now + 86_400)));
         let observed: Map<String, Value> =
-            [("five_hour".to_string(), Value::Null), ("seven_day".to_string(), Value::Object(entry(19.0, now + 86_400)))]
-                .into_iter()
-                .collect();
+            [("fable".to_string(), Value::Null), ("seven_day".to_string(), Value::Object(entry(19.0, now + 86_400)))].into_iter().collect();
 
         // The statusline cannot tell an absent window from missing input: nothing is removed.
         let mut from_statusline = windows.clone();
         apply_windows(&mut from_statusline, &observed, false, now);
-        assert!(from_statusline.contains_key("five_hour"));
+        assert!(from_statusline.contains_key("fable"));
 
         assert_eq!(apply_windows(&mut windows, &observed, true, now), (true, true));
-        assert!(!windows.contains_key("five_hour"));
+        assert!(!windows.contains_key("fable"));
         assert_eq!(windows.obj("seven_day").and_then(|w| w.f64_of("usedPercent")), Some(19.0));
     }
 
@@ -352,7 +407,7 @@ mod tests {
     fn an_ended_window_is_not_brought_back() {
         let now = 20_000;
         let mut windows = Map::new();
-        let ended: Map<String, Value> = [("five_hour".to_string(), Value::Object(entry(40.0, now - 60)))].into_iter().collect();
+        let ended: Map<String, Value> = [("fable".to_string(), Value::Object(entry(40.0, now - 60)))].into_iter().collect();
         assert_eq!(apply_windows(&mut windows, &ended, false, now), (false, false));
         assert!(windows.is_empty());
     }
@@ -372,5 +427,63 @@ mod tests {
         assert_eq!(e["usedPercent"].as_f64(), Some(100.0));
         assert!(e.get("resetsAt").is_none());
         assert!(claude_entry(None, Some(&json!(5))).is_none());
+        assert!(claude_entry(Some(f64::NAN), None).is_none());
+    }
+
+    #[test]
+    fn current_limits_distinguish_weekly_and_fable_and_ignore_other_scopes() {
+        let rows = json!([
+            {"kind":"weekly_scoped","percent":99,"resets_at":null,"scope":{"model":{"display_name":"Sonnet"}}},
+            {"kind":"weekly_all","percent":78,"resets_at":"2026-11-20T11:00:00Z"},
+            {"kind":"weekly_scoped","percent":32,"resets_at":null,"scope":{"model":{"display_name":"Fable 5.1"}}},
+            {"kind":"session","percent":95,"resets_at":null}
+        ]);
+        let parsed = parse_claude_limits(&rows).unwrap();
+        assert_eq!(parsed["seven_day"]["usedPercent"], 78.0);
+        assert_eq!(parsed["fable"]["usedPercent"], 32.0);
+        assert!(parsed["fable"].get("resetsAt").is_none());
+        assert!(!parsed.contains_key("five_hour"));
+    }
+
+    #[test]
+    fn fable_bucket_prefers_exact_name_without_combining_model_percentages() {
+        let parsed = parse_claude_limits(&json!([
+            {"kind":"weekly_scoped","percent":99,"resets_at":null,"scope":{"model":{"display_name":"FableExtra"}}},
+            {"kind":"weekly_scoped","percent":32,"resets_at":null,"scope":{"model":{"display_name":"fAbLe 5.1"}}},
+            {"kind":"weekly_scoped","percent":42,"resets_at":null,"scope":{"model":{"display_name":"FABLE"}}},
+            {"kind":"weekly_scoped","percent":52,"resets_at":null,"scope":{"model":{"display_name":"Fable 5.2"}}}
+        ]))
+        .unwrap();
+        assert_eq!(parsed["fable"]["usedPercent"], 42.0);
+        assert!(parsed["seven_day"].is_null());
+    }
+
+    #[test]
+    fn missing_and_malformed_limits_do_not_become_zero() {
+        for value in [
+            json!(null),
+            json!({}),
+            json!([null]),
+            json!([{"kind":"weekly_all","resets_at":null}]),
+            json!([{"kind":"weekly_all","percent":-1,"resets_at":null}]),
+            json!([{"kind":"weekly_all","percent":101,"resets_at":null}]),
+            json!([{"kind":"weekly_all","percent":10,"resets_at":"soon"}]),
+        ] {
+            assert!(parse_claude_limits(&value).is_none(), "{value}");
+        }
+        let empty = parse_claude_limits(&json!([])).unwrap();
+        assert!(empty["seven_day"].is_null() && empty["fable"].is_null());
+    }
+
+    #[test]
+    fn obsolete_claude_five_hour_is_removed_and_never_reintroduced() {
+        let mut windows = json!({"five_hour":{"usedPercent":55}, "seven_day":{"usedPercent":78}}).as_object().unwrap().clone();
+        let observed = json!({"five_hour":{"usedPercent":20}, "seven_day":{"usedPercent":80}}).as_object().unwrap().clone();
+        assert_eq!(apply_windows(&mut windows, &observed, false, 10), (true, true));
+        assert!(!windows.contains_key("five_hour"));
+        assert_eq!(windows["seven_day"]["usedPercent"], 80);
+        let empty = parse_claude_limits(&json!([])).unwrap();
+        assert_eq!(apply_windows(&mut windows, &empty, true, 10), (true, true));
+        assert!(windows.is_empty());
     }
 }
